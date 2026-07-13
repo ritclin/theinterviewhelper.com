@@ -84,3 +84,27 @@ After deploying the relay server, point clients at your public URL instead of `l
 ## Health check
 
 `GET /api/health` returns server status and whether Gemini is configured.
+
+## Security (production checklist)
+
+Set these before going live:
+
+| Variable | Purpose |
+|----------|---------|
+| `NODE_ENV=production` | Enables production hardening |
+| `APP_URL` | Restricts Socket.io CORS to your domain |
+| `ADMIN_API_KEY` | Protects session/room admin APIs (`X-Admin-Key` header) |
+| `STRIPE_WEBHOOK_SECRET` | Required for verified Stripe webhooks |
+| `GEMINI_API_KEY` | Keep server-side only; never expose in frontend |
+
+Built-in protections: Helmet security headers, API rate limiting, cryptographically secure room codes, join brute-force limits, AI rate limits, payload size caps, open-redirect prevention on Stripe URLs, and disabled webhook simulation in production.
+
+## Future-proofing roadmap
+
+| Phase | Improvement |
+|-------|---------------|
+| Now | Single-instance in-memory state (fine for MVP) |
+| Next | Redis for rooms + rate limits (multi-instance) |
+| Next | PostgreSQL for sessions/subscriptions persistence |
+| Next | User authentication (OAuth/JWT) replacing email-only subscription lookup |
+| Next | End-to-end room encryption for screenshot streams |

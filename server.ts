@@ -1,11 +1,22 @@
 import express from "express";
 import http from "http";
 import path from "path";
+import helmet from "helmet";
+import rateLimit from "express-rate-limit";
 import { Server as SocketIOServer } from "socket.io";
 import { createServer as createViteServer } from "vite";
 import { GoogleGenAI } from "@google/genai";
 import dotenv from "dotenv";
 import Stripe from "stripe";
+import {
+  generateSecureRoomCode,
+  getAllowedOrigins,
+  isValidRoomCode,
+  requireAdminKey,
+  sanitizeRedirectUrl,
+  estimateBase64Bytes,
+  LIMITS,
+} from "./security.ts";
 
 dotenv.config();
 
@@ -29,15 +40,47 @@ if (apiKey && apiKey !== "MY_GEMINI_API_KEY" && apiKey.trim() !== "") {
 
 async function startServer() {
   const app = express();
+  const isProduction = process.env.NODE_ENV === "production";
+  app.set("trust proxy", 1);
+
+  app.use(
+    helmet({
+      contentSecurityPolicy: isProduction
+        ? {
+            directives: {
+              defaultSrc: ["'self'"],
+              scriptSrc: ["'self'"],
+              styleSrc: ["'self'", "'unsafe-inline'"],
+              imgSrc: ["'self'", "data:", "https:"],
+              connectSrc: ["'self'", "wss:", "ws:"],
+              fontSrc: ["'self'", "data:"],
+              objectSrc: ["'none'"],
+              frameAncestors: ["'none'"],
+            },
+          }
+        : false,
+      crossOriginEmbedderPolicy: false,
+    })
+  );
+
+  const apiLimiter = rateLimit({
+    windowMs: 15 * 60 * 1000,
+    max: isProduction ? 300 : 1000,
+    standardHeaders: true,
+    legacyHeaders: false,
+  });
+  app.use("/api/", apiLimiter);
+
   const server = http.createServer(app);
   const PORT = Number(process.env.PORT) || 3000;
+  const allowedOrigins = getAllowedOrigins();
   
-  // Socket.io with wide CORS for cross-platform clients (Desktop PySocketIO and React Native Expo)
   const io = new SocketIOServer(server, {
     cors: {
-      origin: "*",
+      origin: allowedOrigins,
       methods: ["GET", "POST"]
-    }
+    },
+    maxHttpBufferSize: LIMITS.MAX_IMAGE_BYTES + 512 * 1024,
   });
 
   // Room pairing state
@@ -48,7 +91,11 @@ async function startServer() {
     created: number;
     history: Array<{ role: string; content: string; timestamp: string }>;
     scenario?: { title: string; company: string; role: string; };
+    aiInProgress?: boolean;
   }>();
+
+  const joinAttemptsByIp = new Map<string, { count: number; resetAt: number }>();
+  const aiRequestTimestamps = new Map<string, number[]>();
 
   // Map of socket.id -> roomCode to handle cleanups
   const socketToRoom = new Map<string, string>();
@@ -276,13 +323,17 @@ LIMIT 50;
     const logId = "whl_" + Math.random().toString(36).substring(2, 10);
     
     try {
+      if (isProduction && (!stripe || !sig || !webhookSecret)) {
+        return res.status(503).json({ error: "Stripe webhooks are not configured." });
+      }
+
       if (stripe && sig && webhookSecret) {
-        // Real Stripe webhook verification
         event = stripe.webhooks.constructEvent(req.body, sig as string, webhookSecret);
-      } else {
-        // Fallback: parse direct raw buffer or JSON body
+      } else if (!isProduction) {
         const bodyString = Buffer.isBuffer(req.body) ? req.body.toString() : JSON.stringify(req.body);
         event = JSON.parse(bodyString);
+      } else {
+        return res.status(400).send("Webhook Error: Invalid signature.");
       }
     } catch (err: any) {
       console.error(`[Webhook Verification Error]: ${err.message}`);
@@ -363,8 +414,8 @@ LIMIT 50;
   });
 
   // API middleware for general JSON routes
-  app.use(express.json({ limit: "50mb" }));
-  app.use(express.urlencoded({ limit: "50mb", extended: true }));
+  app.use(express.json({ limit: LIMITS.JSON_BODY }));
+  app.use(express.urlencoded({ limit: LIMITS.JSON_BODY, extended: true }));
 
   // Stripe Helper Endpoints
   app.get("/api/stripe/status", (req, res) => {
@@ -373,7 +424,7 @@ LIMIT 50;
     res.json(sub);
   });
 
-  app.get("/api/stripe/webhook-logs", (req, res) => {
+  app.get("/api/stripe/webhook-logs", requireAdminKey, (req, res) => {
     res.json({ logs: webhookLogs });
   });
 
@@ -381,6 +432,9 @@ LIMIT 50;
     const { email, successUrl, cancelUrl } = req.body;
     const targetEmail = (email || "rcsequeira@google.com").toLowerCase().trim();
     const stripe = getStripe();
+    const origin = typeof req.headers.origin === "string" ? req.headers.origin : (process.env.APP_URL || "http://localhost:3000");
+    const safeSuccessUrl = sanitizeRedirectUrl(successUrl, origin);
+    const safeCancelUrl = sanitizeRedirectUrl(cancelUrl, origin);
 
     if (stripe) {
       try {
@@ -404,25 +458,42 @@ LIMIT 50;
           ],
           mode: "subscription",
           customer_email: targetEmail,
-          success_url: successUrl || `${req.headers.origin}/?stripe=success&email=${encodeURIComponent(targetEmail)}`,
-          cancel_url: cancelUrl || `${req.headers.origin}/?stripe=cancel`,
+          success_url: (() => {
+            const url = new URL(safeSuccessUrl);
+            url.searchParams.set("stripe", "success");
+            url.searchParams.set("email", targetEmail);
+            return url.toString();
+          })(),
+          cancel_url: (() => {
+            const url = new URL(safeCancelUrl);
+            url.searchParams.set("stripe", "cancel");
+            return url.toString();
+          })(),
         });
         res.json({ success: true, url: session.url, mode: "real" });
       } catch (err: any) {
         res.status(500).json({ success: false, error: err.message });
       }
     } else {
-      // Return local sandbox checkout URL redirect
       const mockSessionId = "cs_test_" + Math.random().toString(36).substring(2, 10);
+      const mockUrl = new URL(safeSuccessUrl);
+      mockUrl.searchParams.set("stripe_mock_session", mockSessionId);
+      mockUrl.searchParams.set("email", targetEmail);
       res.json({
         success: true,
-        url: `${req.headers.origin}/?stripe_mock_session=${mockSessionId}&email=${encodeURIComponent(targetEmail)}`,
+        url: mockUrl.toString(),
         mode: "simulated"
       });
     }
   });
 
   app.post("/api/stripe/simulate-webhook", (req, res) => {
+    if (isProduction) {
+      return res.status(403).json({
+        success: false,
+        error: "Webhook simulation is disabled in production.",
+      });
+    }
     const { type, email } = req.body;
     const targetEmail = (email || "rcsequeira@google.com").toLowerCase().trim();
     const logId = "whl_sim_" + Math.random().toString(36).substring(2, 10);
@@ -511,7 +582,7 @@ LIMIT 50;
     });
   });
 
-  app.get("/api/rooms", (req, res) => {
+  app.get("/api/rooms", requireAdminKey, (req, res) => {
     const list = Array.from(rooms.entries()).map(([code, data]) => ({
       roomCode: code,
       clientsCount: data.clientSocketIds.length,
@@ -521,11 +592,11 @@ LIMIT 50;
   });
 
   // Completed sessions endpoints (Phase 5)
-  app.get("/api/sessions", (req, res) => {
+  app.get("/api/sessions", requireAdminKey, (req, res) => {
     res.json({ success: true, sessions: completedSessions });
   });
 
-  app.delete("/api/sessions/:id", (req, res) => {
+  app.delete("/api/sessions/:id", requireAdminKey, (req, res) => {
     const { id } = req.params;
     const idx = completedSessions.findIndex(s => s.id === id);
     if (idx >= 0) {
@@ -536,7 +607,7 @@ LIMIT 50;
     }
   });
 
-  app.post("/api/sessions/clear", (req, res) => {
+  app.post("/api/sessions/clear", requireAdminKey, (req, res) => {
     completedSessions.length = 0;
     res.json({ success: true, message: "All sessions cleared successfully." });
   });
@@ -553,13 +624,42 @@ LIMIT 50;
     }
   }, 15 * 60 * 1000);
 
-  // Helper to generate unique 6-digit code
   function generateRoomCode(): string {
     let code = "";
     do {
-      code = Math.floor(100000 + Math.random() * 900000).toString();
+      code = generateSecureRoomCode();
     } while (rooms.has(code));
     return code;
+  }
+
+  function getClientIp(socket: any): string {
+    return socket.handshake.headers["x-forwarded-for"]?.split(",")[0]?.trim()
+      || socket.handshake.address
+      || "unknown";
+  }
+
+  function canAttemptRoomJoin(ip: string): boolean {
+    const now = Date.now();
+    const entry = joinAttemptsByIp.get(ip);
+    if (!entry || now > entry.resetAt) {
+      joinAttemptsByIp.set(ip, { count: 1, resetAt: now + LIMITS.ROOM_JOIN_WINDOW_MS });
+      return true;
+    }
+    entry.count += 1;
+    return entry.count <= LIMITS.ROOM_JOIN_ATTEMPTS_PER_IP;
+  }
+
+  function canRequestAi(socketId: string): boolean {
+    const now = Date.now();
+    const windowStart = now - 60_000;
+    const timestamps = (aiRequestTimestamps.get(socketId) || []).filter((t) => t > windowStart);
+    if (timestamps.length >= LIMITS.AI_REQUESTS_PER_MINUTE) {
+      aiRequestTimestamps.set(socketId, timestamps);
+      return false;
+    }
+    timestamps.push(now);
+    aiRequestTimestamps.set(socketId, timestamps);
+    return true;
   }
 
   // Socket.io handlers
@@ -595,9 +695,14 @@ LIMIT 50;
     // 2. Join Room (Mobile / Assistant Client)
     socket.on("join-room", (payload, callback) => {
       try {
-        const { roomCode } = payload;
-        if (!roomCode) {
-          if (callback) callback({ success: false, error: "Room code required" });
+        const { roomCode } = payload || {};
+        if (!isValidRoomCode(roomCode)) {
+          if (callback) callback({ success: false, error: "Valid 6-digit room code required" });
+          return;
+        }
+
+        if (!canAttemptRoomJoin(getClientIp(socket))) {
+          if (callback) callback({ success: false, error: "Too many join attempts. Try again later." });
           return;
         }
 
@@ -639,11 +744,14 @@ LIMIT 50;
       const roomCode = socketToRoom.get(socket.id);
       if (!roomCode) return;
 
-      // Broadcast screenshots / raw telemetry to other clients in the same room (e.g. mobile display)
+      if (payload?.image && estimateBase64Bytes(String(payload.image)) > LIMITS.MAX_IMAGE_BYTES) {
+        socket.emit("stream-error", { error: "Image payload exceeds 5MB limit." });
+        return;
+      }
+
       socket.to(`room-${roomCode}`).emit("stream-feed", payload);
     });
 
-    // 4. Request Real-Time Interview Optimization suggestion (Gemini AI prompt)
     socket.on("request-ai-assist", async (payload) => {
       const roomCode = socketToRoom.get(socket.id);
       if (!roomCode) {
@@ -651,16 +759,47 @@ LIMIT 50;
         return;
       }
 
+      if (!canRequestAi(socket.id)) {
+        socket.emit("ai-error", { error: "Rate limit exceeded. Wait before requesting another suggestion." });
+        return;
+      }
+
       const room = rooms.get(roomCode);
       if (!room) return;
 
-      const { prompt, image, audioTranscript, scenario } = payload;
-      if (scenario) {
-        room.scenario = scenario;
+      if (room.aiInProgress) {
+        socket.emit("ai-error", { error: "A suggestion is already being generated for this room." });
+        return;
+      }
+
+      room.aiInProgress = true;
+
+      const { prompt, image, audioTranscript, scenario } = payload || {};
+      if (typeof prompt === "string" && prompt.length > LIMITS.MAX_PROMPT_CHARS) {
+        room.aiInProgress = false;
+        socket.emit("ai-error", { error: "Prompt exceeds maximum length." });
+        return;
+      }
+      if (typeof audioTranscript === "string" && audioTranscript.length > LIMITS.MAX_TRANSCRIPT_CHARS) {
+        room.aiInProgress = false;
+        socket.emit("ai-error", { error: "Transcript exceeds maximum length." });
+        return;
+      }
+      if (image && estimateBase64Bytes(String(image)) > LIMITS.MAX_IMAGE_BYTES) {
+        room.aiInProgress = false;
+        socket.emit("ai-error", { error: "Image payload exceeds 5MB limit." });
+        return;
+      }
+
+      if (scenario && typeof scenario === "object") {
+        room.scenario = {
+          title: String(scenario.title || "").slice(0, 200),
+          company: String(scenario.company || "").slice(0, 100),
+          role: String(scenario.role || "").slice(0, 100),
+        };
       }
       console.log(`Generating optimization suggestion for room ${roomCode}...`);
 
-      // Inform room that suggestion generation started (shows beautiful animated loading spinner)
       io.to(`room-${roomCode}`).emit("ai-start");
 
       const systemInstruction = `You are "The Interview Helper", an elite real-time technical interview optimization expert. 
@@ -677,7 +816,9 @@ Do not include greetings, explanations of code details, or long intros. Speed is
       // Build Gemini contents
       let aiResponseStream = null;
       let completedText = "";
+      const geminiModel = process.env.GEMINI_MODEL || "gemini-2.5-flash";
 
+      try {
       if (aiClient) {
         try {
           const contents: any[] = [];
@@ -695,38 +836,34 @@ Do not include greetings, explanations of code details, or long intros. Speed is
 
           let promptText = "Review the active interview state and suggest the optimal next steps.";
           if (audioTranscript) {
-            promptText += `\nInterviewer spoken content (Transcript): "${audioTranscript}"`;
+            promptText += `\nInterviewer spoken content (Transcript): "${String(audioTranscript).slice(0, LIMITS.MAX_TRANSCRIPT_CHARS)}"`;
           }
           if (prompt) {
-            promptText += `\nDirect Candidate request: "${prompt}"`;
+            promptText += `\nDirect Candidate request: "${String(prompt).slice(0, LIMITS.MAX_PROMPT_CHARS)}"`;
           }
           contents.push({ text: promptText });
 
-          // Call the modern streaming SDK
           aiResponseStream = await aiClient.models.generateContentStream({
-            model: "gemini-3.5-flash",
+            model: geminiModel,
             contents,
             config: {
               systemInstruction,
-              temperature: 0.2, // low temperature for highly deterministic/correct coding answers
+              temperature: 0.2,
             }
           });
 
           for await (const chunk of aiResponseStream) {
             const text = chunk.text || "";
             completedText += text;
-            // Emit real-time word chunks back to room
             io.to(`room-${roomCode}`).emit("ai-chunk", { text });
           }
 
-          // Save suggestion to history
           room.history.push({
             role: "assistant",
             content: completedText,
             timestamp: new Date().toLocaleTimeString()
           });
 
-          // Update active session records (Phase 5)
           saveOrUpdateSession(roomCode, room, false);
 
           io.to(`room-${roomCode}`).emit("ai-end", { fullText: completedText });
@@ -735,12 +872,13 @@ Do not include greetings, explanations of code details, or long intros. Speed is
         } catch (err: any) {
           console.error("Gemini API stream error:", err);
           io.to(`room-${roomCode}`).emit("ai-error", { error: "Gemini API error: " + err.message });
-          // Fall back to high-fidelity simulation if API fails or rate limited
           await runSimulationFallback(roomCode, room, prompt, audioTranscript);
         }
       } else {
-        // Fallback simulation when no API key is specified
         await runSimulationFallback(roomCode, room, prompt, audioTranscript);
+      }
+      } finally {
+        room.aiInProgress = false;
       }
     });
 
@@ -777,6 +915,7 @@ Do not include greetings, explanations of code details, or long intros. Speed is
         }
         socketToRoom.delete(socket.id);
       }
+      aiRequestTimestamps.delete(socket.id);
     });
   });
 

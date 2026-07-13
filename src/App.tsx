@@ -196,18 +196,20 @@ export default function App() {
     fetchWebhookLogs();
     fetchSessions();
     
-    // Set up polling for webhook logs and active sessions every 5 seconds
     const pollInterval = setInterval(() => {
-      fetchWebhookLogs();
-      fetchStats();
-      fetchSessions();
-    }, 5000);
+      if (document.visibilityState === "visible") {
+        fetchWebhookLogs();
+        fetchStats();
+        if (activeSaaSTab === "history") {
+          fetchSessions();
+        }
+      }
+    }, 15000);
 
     return () => clearInterval(pollInterval);
-  }, [userEmail]);
+  }, [userEmail, activeSaaSTab]);
 
   useEffect(() => {
-    // 1. Initialize Socket.io Connection to current origin
     const socket = io(window.location.origin, {
       transports: ["websocket", "polling"],
       reconnectionAttempts: 10,
@@ -215,27 +217,31 @@ export default function App() {
     });
 
     socketRef.current = socket;
+    let pendingPingAt: number | null = null;
 
     socket.on("connect", () => {
       setSocketConnected(true);
       fetchStats();
       console.log("Socket client successfully linked:", socket.id);
       
-      // Setup latency ping-pong
       pingIntervalRef.current = setInterval(() => {
-        const start = Date.now();
+        pendingPingAt = Date.now();
         socket.emit("heartbeat");
-        socket.once("heartbeat-ack", () => {
-          const latency = Date.now() - start;
-          setPingLatency(latency);
-          setLatencyHistory(prev => {
-            const timeStr = new Date().toLocaleTimeString().split(" ")[0];
-            const next = [...prev, { time: timeStr, latency }];
-            if (next.length > 15) next.shift();
-            return next;
-          });
-        });
       }, 5000);
+    });
+
+    socket.on("heartbeat-ack", () => {
+      if (pendingPingAt !== null) {
+        const latency = Date.now() - pendingPingAt;
+        setPingLatency(latency);
+        pendingPingAt = null;
+        setLatencyHistory(prev => {
+          const timeStr = new Date().toLocaleTimeString().split(" ")[0];
+          const next = [...prev, { time: timeStr, latency }];
+          if (next.length > 15) next.shift();
+          return next;
+        });
+      }
     });
 
     socket.on("disconnect", () => {
@@ -320,7 +326,7 @@ export default function App() {
       socket.disconnect();
       if (pingIntervalRef.current) clearInterval(pingIntervalRef.current);
     };
-  }, [hostRoomCode, clientJoinedCode]);
+  }, []);
 
   // 1. Host create room action
   const handleCreateRoom = () => {
