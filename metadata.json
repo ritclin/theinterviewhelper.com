@@ -1,0 +1,6 @@
+{
+  "name": "The Interview Helper",
+  "description": "High-performance, real-time interview optimization platform with sub-2-second latency.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
