@@ -28,12 +28,7 @@ export default function App() {
   const [activeRelayRooms, setActiveRelayRooms] = useState<any[]>([]);
 
   // SaaS Billing and Stripe States
-  const [userEmail, setUserEmail] = useState<string>(() => {
-    if (typeof window !== "undefined") {
-      return localStorage.getItem("tih_user_email") || "";
-    }
-    return "";
-  });
+  const [userEmail, setUserEmail] = useState<string>("");
   const [subscription, setSubscription] = useState<{
     status: "active" | "canceled" | "none";
     email: string;
@@ -210,7 +205,6 @@ export default function App() {
     const finalizePayment = async () => {
       if (emailFromStripe) {
         setUserEmail(emailFromStripe);
-        localStorage.setItem("tih_user_email", emailFromStripe);
       }
 
       if (sessionId) {
@@ -382,6 +376,11 @@ export default function App() {
   const handleCreateRoom = () => {
     if (!socketRef.current || !socketConnected) {
       alert("Socket is currently offline. Please wait for server link.");
+      return;
+    }
+
+    if (!userEmail.trim()) {
+      alert("Please enter your billing email in the SaaS Subscriber field before creating a room.");
       return;
     }
 
@@ -590,10 +589,11 @@ export default function App() {
                         onChange={(e) => {
                           const val = e.target.value;
                           setUserEmail(val);
-                          localStorage.setItem("tih_user_email", val);
                         }}
-                        placeholder="email@example.com"
-                        className="bg-transparent border-b border-slate-800 text-[11px] text-slate-300 font-mono focus:border-indigo-500 focus:outline-none w-36 truncate py-0.5"
+                        placeholder="Enter your email"
+                        required
+                        autoComplete="email"
+                        className="bg-transparent border-b border-slate-800 text-[11px] text-slate-300 font-mono focus:border-indigo-500 focus:outline-none w-44 truncate py-0.5"
                       />
                     </div>
                   </div>
@@ -993,8 +993,10 @@ export default function App() {
                 No complex matrix. A single comprehensive subscription giving you real-time screen capture analysis and loopback suggestions.
               </p>
               <div className="mt-4 inline-flex items-center gap-2 bg-slate-900 border border-slate-800 rounded-xl px-4 py-2 text-xs">
-                <span className="text-slate-400 font-mono">Current Subscriber email:</span>
-                <span className="text-indigo-400 font-mono font-semibold">{userEmail}</span>
+                <span className="text-slate-400 font-mono">Billing email:</span>
+                <span className={`font-mono font-semibold ${userEmail ? "text-indigo-400" : "text-amber-400"}`}>
+                  {userEmail || "Not set — enter your email on the Platform tab"}
+                </span>
               </div>
             </div>
 

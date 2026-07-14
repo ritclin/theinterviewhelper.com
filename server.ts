@@ -508,7 +508,10 @@ LIMIT 50;
 
   app.post("/api/stripe/checkout", async (req, res) => {
     const { email, successUrl, cancelUrl } = req.body;
-    const targetEmail = (email || "rcsequeira@google.com").toLowerCase().trim();
+    const targetEmail = (email || "").toLowerCase().trim();
+    if (!targetEmail) {
+      return res.status(400).json({ success: false, error: "A valid billing email is required." });
+    }
     const stripe = getStripe();
     const origin = typeof req.headers.origin === "string" ? req.headers.origin : (process.env.APP_URL || "http://localhost:3000");
     const safeSuccessUrl = sanitizeRedirectUrl(successUrl, origin);
@@ -575,7 +578,10 @@ LIMIT 50;
       });
     }
     const { type, email } = req.body;
-    const targetEmail = (email || "rcsequeira@google.com").toLowerCase().trim();
+    const targetEmail = (email || "").toLowerCase().trim();
+    if (!targetEmail) {
+      return res.status(400).json({ success: false, error: "A valid billing email is required." });
+    }
     const logId = "whl_sim_" + Math.random().toString(36).substring(2, 10);
     
     let mockPayload: any = {};
