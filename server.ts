@@ -502,6 +502,56 @@ LIMIT 50;
     }
   });
 
+  app.post("/api/stripe/sync-subscription", async (req, res) => {
+    const { email } = req.body || {};
+    const targetEmail = (email || "").toLowerCase().trim();
+
+    if (!targetEmail) {
+      return res.status(400).json({ success: false, error: "A valid billing email is required." });
+    }
+
+    const stripe = getStripe();
+    if (!stripe) {
+      return res.status(503).json({ success: false, error: "Stripe is not configured." });
+    }
+
+    try {
+      const customers = await stripe.customers.list({ email: targetEmail, limit: 5 });
+      if (customers.data.length === 0) {
+        return res.json({
+          success: false,
+          error: "No Stripe customer found for this email. Use the same email as checkout.",
+        });
+      }
+
+      for (const customer of customers.data) {
+        const activeSubs = await stripe.subscriptions.list({
+          customer: customer.id,
+          status: "active",
+          limit: 1,
+        });
+        const trialingSubs = await stripe.subscriptions.list({
+          customer: customer.id,
+          status: "trialing",
+          limit: 1,
+        });
+        const match = activeSubs.data[0] || trialingSubs.data[0];
+        if (match) {
+          const subscription = activateSubscription(targetEmail, match.id);
+          return res.json({ success: true, subscription, source: "stripe-sync" });
+        }
+      }
+
+      res.json({
+        success: false,
+        error: "No active Stripe subscription found for this email.",
+      });
+    } catch (err: any) {
+      console.error("[Billing] sync-subscription error:", err);
+      res.status(500).json({ success: false, error: err.message });
+    }
+  });
+
   app.get("/api/stripe/webhook-logs", requireAdminKey, (req, res) => {
     res.json({ logs: webhookLogs });
   });

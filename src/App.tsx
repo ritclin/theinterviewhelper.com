@@ -92,18 +92,40 @@ export default function App() {
 
   // Fetch subscription status
   const fetchSubscription = async (email: string) => {
+    if (!email.trim()) return;
     setLoadingSub(true);
     try {
       const res = await fetch(`/api/stripe/status?email=${encodeURIComponent(email)}`);
       if (res.ok) {
         const data = await res.json();
         setSubscription(data);
+        return data;
       }
     } catch (err) {
       console.warn("Failed to fetch subscription status:", err);
     } finally {
       setLoadingSub(false);
     }
+    return null;
+  };
+
+  const syncSubscriptionFromStripe = async (email: string): Promise<boolean> => {
+    if (!email.trim()) return false;
+    try {
+      const res = await fetch("/api/stripe/sync-subscription", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ email: email.trim() }),
+      });
+      const data = await res.json();
+      if (data.success && data.subscription) {
+        setSubscription(data.subscription);
+        return true;
+      }
+    } catch (err) {
+      console.warn("Failed to sync subscription from Stripe:", err);
+    }
+    return false;
   };
 
   // Fetch webhook logs
@@ -224,7 +246,10 @@ export default function App() {
       }
 
       if (emailFromStripe) {
-        await fetchSubscription(emailFromStripe);
+        const status = await fetchSubscription(emailFromStripe);
+        if (status?.status !== "active") {
+          await syncSubscriptionFromStripe(emailFromStripe);
+        }
       }
 
       window.history.replaceState({}, "", window.location.pathname);
@@ -373,7 +398,7 @@ export default function App() {
   }, []);
 
   // 1. Host create room action
-  const handleCreateRoom = () => {
+  const handleCreateRoom = async () => {
     if (!socketRef.current || !socketConnected) {
       alert("Socket is currently offline. Please wait for server link.");
       return;
@@ -385,9 +410,12 @@ export default function App() {
     }
 
     if (subscription.status !== "active") {
-      alert("🔒 PLATINUM SUBSCRIPTION REQUIRED\n\nTo generate pairing rooms, activate your €20/mo subscription using the same email you used at checkout.");
-      setShowCheckoutModal(true);
-      return;
+      const synced = await syncSubscriptionFromStripe(userEmail.trim());
+      if (!synced) {
+        alert("🔒 PLATINUM SUBSCRIPTION REQUIRED\n\nNo active subscription found for this email. Subscribe with the same email you enter here, or click Refresh below if you already paid.");
+        setShowCheckoutModal(true);
+        return;
+      }
     }
 
     socketRef.current.emit("create-room", (response: any) => {
@@ -643,6 +671,24 @@ export default function App() {
                       >
                         <CreditCard className="w-3 h-3" />
                         Subscribe (€20/mo)
+                      </button>
+                      <button 
+                        onClick={async () => {
+                          if (!userEmail.trim()) {
+                            alert("Enter your billing email first.");
+                            return;
+                          }
+                          const synced = await syncSubscriptionFromStripe(userEmail.trim());
+                          if (synced) {
+                            alert("Subscription synced from Stripe. You can now generate room codes.");
+                          } else {
+                            alert("No active subscription found in Stripe for this email.");
+                          }
+                        }}
+                        className="w-full mt-2 py-1.5 rounded bg-slate-950 hover:bg-slate-900 text-slate-300 border border-slate-800 text-[10px] font-bold cursor-pointer transition-colors flex items-center justify-center gap-1"
+                      >
+                        <RefreshCw className="w-3 h-3" />
+                        Refresh from Stripe
                       </button>
                     </div>
                   )}
