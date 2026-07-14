@@ -1,6 +1,7 @@
 import express from "express";
 import http from "http";
 import path from "path";
+import fs from "fs";
 import helmet from "helmet";
 import rateLimit from "express-rate-limit";
 import { Server as SocketIOServer } from "socket.io";
@@ -19,6 +20,13 @@ import {
 } from "./security.ts";
 
 dotenv.config();
+
+function isRunningProductionBundle(): boolean {
+  if (process.env.NODE_ENV === "production") return true;
+  if (process.argv[1]?.endsWith("server.cjs")) return true;
+  if (typeof __filename !== "undefined" && __filename.endsWith("server.cjs")) return true;
+  return false;
+}
 
 // Initialize Gemini SDK with named parameters as instructed
 const apiKey = process.env.GEMINI_API_KEY;
@@ -40,7 +48,8 @@ if (apiKey && apiKey !== "MY_GEMINI_API_KEY" && apiKey.trim() !== "") {
 
 async function startServer() {
   const app = express();
-  const isProduction = process.env.NODE_ENV === "production";
+  const isProduction = isRunningProductionBundle();
+  console.log(`Runtime mode: ${isProduction ? "production" : "development"} (NODE_ENV=${process.env.NODE_ENV ?? "unset"})`);
   app.set("trust proxy", 1);
 
   app.use(
@@ -1079,17 +1088,24 @@ function streamState(screenshotBase64: string, transcript: string) {
     console.log(`Simulated stream successfully completed for room ${roomCode}.`);
   }
 
-  // Vite development integration
-  if (process.env.NODE_ENV !== "production") {
+  // Vite development integration (local dev only — production bundle serves /dist)
+  if (!isProduction) {
     console.log("Starting development mode with Vite HMR middleware...");
     const vite = await createViteServer({
-      server: { middlewareMode: true },
+      server: {
+        middlewareMode: true,
+        allowedHosts: [".railway.app", "theinterviewhelper.com", "www.theinterviewhelper.com", "localhost"],
+      },
       appType: "spa"
     });
     app.use(vite.middlewares);
   } else {
     console.log("Serving static production assets from /dist...");
     const distPath = path.join(process.cwd(), "dist");
+    if (!fs.existsSync(path.join(distPath, "index.html"))) {
+      console.error("Production build missing: dist/index.html not found. Run npm run build.");
+      process.exit(1);
+    }
     app.use(express.static(distPath));
     app.get("*", (req, res) => {
       res.sendFile(path.join(distPath, "index.html"));
