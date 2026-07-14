@@ -122,20 +122,40 @@ async function startServer() {
   }
 
   // In-memory subscription ledger: email -> subscription info
-  // Seed rcsequeira@google.com as unsubscribed by default so they can test the signup workflow,
-  // but they can also subscribe instantly via one-click in the UI!
   const subscriptions = new Map<string, {
     status: "active" | "canceled" | "none";
     email: string;
     currentPeriodEnd: number;
     subscriptionId?: string;
-  }>([
-    ["rcsequeira@google.com", {
-      status: "none",
-      email: "rcsequeira@google.com",
-      currentPeriodEnd: 0
-    }]
-  ]);
+  }>();
+
+  function activateSubscription(email: string, subscriptionId?: string) {
+    const normalized = email.toLowerCase().trim();
+    if (!normalized) return null;
+    const sub = {
+      status: "active" as const,
+      email: normalized,
+      currentPeriodEnd: Date.now() + 30 * 24 * 60 * 60 * 1000,
+      subscriptionId: subscriptionId || "sub_" + Math.random().toString(36).substring(2, 10),
+    };
+    subscriptions.set(normalized, sub);
+    console.log(`[Billing] Subscription activated for: ${normalized}`);
+    return sub;
+  }
+
+  async function resolveStripeCustomerEmail(stripe: Stripe, customerRef: unknown): Promise<string> {
+    if (typeof customerRef === "string") {
+      try {
+        const customer = await stripe.customers.retrieve(customerRef);
+        if (!customer.deleted && "email" in customer && customer.email) {
+          return customer.email.toLowerCase().trim();
+        }
+      } catch (err) {
+        console.warn("[Billing] Could not resolve Stripe customer email:", err);
+      }
+    }
+    return "";
+  }
 
   // Webhook event logger
   const webhookLogs: Array<{
@@ -362,19 +382,16 @@ LIMIT 50;
       console.log(`[Stripe Webhook Engine] Event Received: ${eventType}`);
 
       if (eventType === "checkout.session.completed") {
-        const email = (dataObject.customer_email || dataObject.customer_details?.email || "").toLowerCase().trim();
+        const email = (dataObject.customer_email || dataObject.customer_details?.email || dataObject.metadata?.email || "").toLowerCase().trim();
         const subId = dataObject.subscription || "sub_mock_" + Math.random().toString(36).substring(2, 10);
         if (email) {
-          subscriptions.set(email, {
-            status: "active",
-            email,
-            currentPeriodEnd: Date.now() + 30 * 24 * 60 * 60 * 1000,
-            subscriptionId: subId
-          });
-          console.log(`[Stripe Webhook Engine] Subscription activated for: ${email}`);
+          activateSubscription(email, subId);
         }
       } else if (eventType === "customer.subscription.deleted") {
-        const email = (dataObject.customer_email || "").toLowerCase().trim();
+        let email = (dataObject.customer_email || dataObject.metadata?.email || "").toLowerCase().trim();
+        if (!email && stripe) {
+          email = await resolveStripeCustomerEmail(stripe, dataObject.customer);
+        }
         if (email) {
           const sub = subscriptions.get(email);
           if (sub) {
@@ -386,15 +403,22 @@ LIMIT 50;
           }
           console.log(`[Stripe Webhook Engine] Subscription deleted for: ${email}`);
         }
-      } else if (eventType === "customer.subscription.updated") {
-        const email = (dataObject.customer_email || "").toLowerCase().trim();
+      } else if (eventType === "customer.subscription.updated" || eventType === "customer.subscription.created") {
+        let email = (dataObject.customer_email || dataObject.metadata?.email || "").toLowerCase().trim();
+        if (!email && stripe) {
+          email = await resolveStripeCustomerEmail(stripe, dataObject.customer);
+        }
         if (email) {
-          const sub = subscriptions.get(email);
-          if (sub) {
-            subscriptions.set(email, {
-              ...sub,
-              status: dataObject.status === "active" ? "active" : "canceled"
-            });
+          if (dataObject.status === "active" || dataObject.status === "trialing") {
+            activateSubscription(email, dataObject.id);
+          } else {
+            const sub = subscriptions.get(email);
+            if (sub) {
+              subscriptions.set(email, {
+                ...sub,
+                status: dataObject.status === "active" ? "active" : "canceled"
+              });
+            }
           }
         }
       }
@@ -428,9 +452,54 @@ LIMIT 50;
 
   // Stripe Helper Endpoints
   app.get("/api/stripe/status", (req, res) => {
-    const email = (req.query.email as string || "rcsequeira@google.com").toLowerCase().trim();
+    const email = (req.query.email as string || "").toLowerCase().trim();
+    if (!email) {
+      return res.status(400).json({ success: false, error: "Email query parameter is required." });
+    }
     const sub = subscriptions.get(email) || { status: "none", email, currentPeriodEnd: 0 };
     res.json(sub);
+  });
+
+  app.post("/api/stripe/confirm-session", async (req, res) => {
+    const { sessionId } = req.body || {};
+    const stripe = getStripe();
+
+    if (!sessionId || typeof sessionId !== "string") {
+      return res.status(400).json({ success: false, error: "sessionId is required." });
+    }
+    if (!stripe) {
+      return res.status(503).json({ success: false, error: "Stripe is not configured." });
+    }
+
+    try {
+      const session = await stripe.checkout.sessions.retrieve(sessionId);
+      const isPaid = session.payment_status === "paid" || session.status === "complete";
+
+      if (!isPaid) {
+        return res.json({ success: false, error: "Checkout session is not paid yet.", status: session.status });
+      }
+
+      const email = (
+        session.customer_email ||
+        session.customer_details?.email ||
+        session.metadata?.email ||
+        ""
+      ).toLowerCase().trim();
+
+      if (!email) {
+        return res.status(400).json({ success: false, error: "No customer email found on checkout session." });
+      }
+
+      const subscription = activateSubscription(
+        email,
+        typeof session.subscription === "string" ? session.subscription : undefined
+      );
+
+      res.json({ success: true, subscription });
+    } catch (err: any) {
+      console.error("[Billing] confirm-session error:", err);
+      res.status(500).json({ success: false, error: err.message });
+    }
   });
 
   app.get("/api/stripe/webhook-logs", requireAdminKey, (req, res) => {
@@ -467,10 +536,12 @@ LIMIT 50;
           ],
           mode: "subscription",
           customer_email: targetEmail,
+          metadata: { email: targetEmail },
           success_url: (() => {
             const url = new URL(safeSuccessUrl);
             url.searchParams.set("stripe", "success");
             url.searchParams.set("email", targetEmail);
+            url.searchParams.set("session_id", "{CHECKOUT_SESSION_ID}");
             return url.toString();
           })(),
           cancel_url: (() => {
@@ -528,12 +599,7 @@ LIMIT 50;
         }
       };
       
-      subscriptions.set(targetEmail, {
-        status: "active",
-        email: targetEmail,
-        currentPeriodEnd: Date.now() + 30 * 24 * 60 * 60 * 1000,
-        subscriptionId: mockPayload.data.object.subscription
-      });
+      activateSubscription(targetEmail, mockPayload.data.object.subscription);
     } else if (type === "customer.subscription.deleted") {
       mockPayload = {
         id: "evt_mock_" + Math.random().toString(36).substring(2, 10),

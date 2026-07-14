@@ -28,13 +28,18 @@ export default function App() {
   const [activeRelayRooms, setActiveRelayRooms] = useState<any[]>([]);
 
   // SaaS Billing and Stripe States
-  const [userEmail, setUserEmail] = useState<string>("rcsequeira@google.com");
+  const [userEmail, setUserEmail] = useState<string>(() => {
+    if (typeof window !== "undefined") {
+      return localStorage.getItem("tih_user_email") || "";
+    }
+    return "";
+  });
   const [subscription, setSubscription] = useState<{
     status: "active" | "canceled" | "none";
     email: string;
     currentPeriodEnd: number;
     subscriptionId?: string;
-  }>({ status: "none", email: "rcsequeira@google.com", currentPeriodEnd: 0 });
+  }>({ status: "none", email: "", currentPeriodEnd: 0 });
   const [webhookLogs, setWebhookLogs] = useState<any[]>([]);
   const [loadingSub, setLoadingSub] = useState(false);
   const [showCheckoutModal, setShowCheckoutModal] = useState(false);
@@ -142,6 +147,10 @@ export default function App() {
 
   // Initiate mock/real Stripe checkout
   const handleStripeCheckout = async () => {
+    if (!userEmail.trim()) {
+      alert("Please enter your billing email before subscribing.");
+      return;
+    }
     try {
       const res = await fetch("/api/stripe/checkout", {
         method: "POST",
@@ -190,8 +199,49 @@ export default function App() {
     }
   };
 
+  // After Stripe Checkout redirect — activate subscription immediately
+  useEffect(() => {
+    const params = new URLSearchParams(window.location.search);
+    if (params.get("stripe") !== "success") return;
+
+    const emailFromStripe = (params.get("email") || "").trim();
+    const sessionId = params.get("session_id") || "";
+
+    const finalizePayment = async () => {
+      if (emailFromStripe) {
+        setUserEmail(emailFromStripe);
+        localStorage.setItem("tih_user_email", emailFromStripe);
+      }
+
+      if (sessionId) {
+        try {
+          const res = await fetch("/api/stripe/confirm-session", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ sessionId }),
+          });
+          const data = await res.json();
+          if (data.success && data.subscription) {
+            setSubscription(data.subscription);
+          }
+        } catch (err) {
+          console.warn("Failed to confirm Stripe checkout session:", err);
+        }
+      }
+
+      if (emailFromStripe) {
+        await fetchSubscription(emailFromStripe);
+      }
+
+      window.history.replaceState({}, "", window.location.pathname);
+    };
+
+    finalizePayment();
+  }, []);
+
   // Load subscription status and webhooks on load and whenever email changes
   useEffect(() => {
+    if (!userEmail) return;
     fetchSubscription(userEmail);
     fetchWebhookLogs();
     fetchSessions();
@@ -336,7 +386,7 @@ export default function App() {
     }
 
     if (subscription.status !== "active") {
-      alert("🔒 PLATINUM SUBSCRIPTION REQUIRED\n\nTo generate new pairing rooms and use the companion overlays, please activate your €20/mo subscription. Opening Stripe Checkout simulator!");
+      alert("🔒 PLATINUM SUBSCRIPTION REQUIRED\n\nTo generate pairing rooms, activate your €20/mo subscription using the same email you used at checkout.");
       setShowCheckoutModal(true);
       return;
     }
@@ -540,6 +590,7 @@ export default function App() {
                         onChange={(e) => {
                           const val = e.target.value;
                           setUserEmail(val);
+                          localStorage.setItem("tih_user_email", val);
                         }}
                         placeholder="email@example.com"
                         className="bg-transparent border-b border-slate-800 text-[11px] text-slate-300 font-mono focus:border-indigo-500 focus:outline-none w-36 truncate py-0.5"
