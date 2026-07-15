@@ -147,6 +147,31 @@ async function startServer() {
   // Map of socket.id -> roomCode to handle cleanups
   const socketToRoom = new Map<string, string>();
 
+  // Rooms whose host has temporarily dropped: roomCode -> deletion timer.
+  // Gives a paired host a grace window to reconnect (mobile screen-lock, wifi
+  // handoff, app backgrounding) and reclaim the SAME code, instead of destroying
+  // the room and invalidating the code the Windows client is still holding.
+  const hostDisconnectTimers = new Map<string, NodeJS.Timeout>();
+  const HOST_RECONNECT_GRACE_MS = 90 * 1000;
+
+  function clearHostDisconnectTimer(roomCode: string) {
+    const timer = hostDisconnectTimers.get(roomCode);
+    if (timer) {
+      clearTimeout(timer);
+      hostDisconnectTimers.delete(roomCode);
+    }
+  }
+
+  function finalizeAndDeleteRoom(roomCode: string, reason: string) {
+    const room = rooms.get(roomCode);
+    clearHostDisconnectTimer(roomCode);
+    if (!room) return;
+    io.to(`room-${roomCode}`).emit("room-closed", { message: reason });
+    if (room.history.length > 0) saveOrUpdateSession(roomCode, room, true);
+    rooms.delete(roomCode);
+    console.log(`Room ${roomCode} finalized and deleted: ${reason}`);
+  }
+
   // --- SaaS Stripe & Subscriptions Engine ---
   let stripeClient: Stripe | null = null;
   function getStripe(): Stripe | null {
@@ -1033,9 +1058,14 @@ Rules: No greetings. Scannable in 5-8 seconds. Be accurate to the candidate's se
     for (const [code, data] of rooms.entries()) {
       if (now - data.created > 2 * 60 * 60 * 1000) {
         io.to(`room-${code}`).emit("room-expired", { message: "Room expired due to inactivity." });
+        clearHostDisconnectTimer(code);
         rooms.delete(code);
         console.log(`Garbage collected inactive room: ${code}`);
       }
+    }
+    // Sweep expired room-join rate-limit entries so the map can't grow unbounded.
+    for (const [ip, entry] of joinAttemptsByIp.entries()) {
+      if (now > entry.resetAt) joinAttemptsByIp.delete(ip);
     }
   }, 15 * 60 * 1000);
 
@@ -1135,6 +1165,47 @@ Rules: No greetings. Scannable in 5-8 seconds. Be accurate to the candidate's se
       }
     });
 
+    // 1b. Resume Room (host reconnected within the grace window — reclaim same code)
+    socket.on("resume-room", async (payload, callback) => {
+      try {
+        const email = String(payload?.email || "").toLowerCase().trim();
+        const roomCode = payload?.roomCode;
+        if (!isValidRoomCode(roomCode) || !email) {
+          if (callback) callback({ success: false, error: "Email and valid room code required.", code: "ROOM_GONE" });
+          return;
+        }
+        const room = rooms.get(roomCode);
+        if (!room || room.ownerEmail !== email) {
+          // Room expired or not owned by this email — caller should create a fresh one.
+          if (callback) callback({ success: false, error: "Session expired. Starting a new room.", code: "ROOM_GONE" });
+          return;
+        }
+        if (!hasActiveSubscription(email)) {
+          await syncSubscriptionFromStripe(email);
+        }
+        if (!hasActiveSubscription(email)) {
+          if (callback) callback({ success: false, error: "Active subscription required.", code: "SUBSCRIPTION_REQUIRED" });
+          return;
+        }
+
+        clearHostDisconnectTimer(roomCode);
+        room.hostSocketId = socket.id;
+        socketToRoom.set(socket.id, roomCode);
+        socket.join(`room-${roomCode}`);
+        const clientsCount = room.clientSocketIds.length;
+
+        // Re-notify the room so a still-connected Windows client (and the host UI)
+        // reflect the restored pairing without re-entering the code.
+        io.to(`room-${roomCode}`).emit("paired", { roomCode, clientsCount, hostSocketId: socket.id });
+
+        console.log(`Host resumed room ${roomCode} (${email}), clients=${clientsCount}`);
+        if (callback) callback({ success: true, roomCode, history: room.history, clientsCount });
+      } catch (err: any) {
+        console.error("Error resuming room:", err);
+        if (callback) callback({ success: false, error: err.message, code: "ROOM_GONE" });
+      }
+    });
+
     // 2. Join Room (Mobile / Assistant Client)
     socket.on("join-room", (payload, callback) => {
       try {
@@ -1167,8 +1238,10 @@ Rules: No greetings. Scannable in 5-8 seconds. Be accurate to the candidate's se
           return;
         }
 
-        // Add client to room
-        room.clientSocketIds.push(socket.id);
+        // Add client to room (dedupe so reconnects/re-joins don't inflate the count)
+        if (!room.clientSocketIds.includes(socket.id)) {
+          room.clientSocketIds.push(socket.id);
+        }
         socketToRoom.set(socket.id, roomCode);
         socket.join(`room-${roomCode}`);
 
@@ -1415,18 +1488,23 @@ Rules: No greetings. Scannable in 5-8 seconds. Be accurate to the candidate's se
         const room = rooms.get(roomCode);
         if (room) {
           if (room.hostSocketId === socket.id) {
-            // Host left - destroy the room completely
-            io.to(`room-${roomCode}`).emit("room-closed", {
-              message: "The host capture client disconnected. Pairing terminated."
+            // Host dropped - keep the room alive for a grace window so a
+            // reconnecting host can reclaim the SAME code via "resume-room".
+            // Notify the room of a transient drop (not a hard close) so clients
+            // can show "reconnecting" instead of tearing down the session.
+            io.to(`room-${roomCode}`).emit("host-disconnected", {
+              message: "Host connection lost. Waiting for reconnect…",
+              graceMs: HOST_RECONNECT_GRACE_MS,
             });
-            
-            // Finalize active session in records if suggestions were generated (Phase 5)
-            if (room.history.length > 0) {
-              saveOrUpdateSession(roomCode, room, true);
-            }
-            
-            rooms.delete(roomCode);
-            console.log(`Room ${roomCode} deleted because host disconnected.`);
+            clearHostDisconnectTimer(roomCode);
+            hostDisconnectTimers.set(
+              roomCode,
+              setTimeout(
+                () => finalizeAndDeleteRoom(roomCode, "Host did not reconnect in time. Pairing terminated."),
+                HOST_RECONNECT_GRACE_MS
+              )
+            );
+            console.log(`Host of room ${roomCode} disconnected; grace timer started.`);
           } else {
             // Client left - remove client from array and notify
             room.clientSocketIds = room.clientSocketIds.filter(id => id !== socket.id);
