@@ -336,7 +336,7 @@ export default function App() {
       return;
     }
 
-    socketRef.current.emit("create-room", (response: any) => {
+    socketRef.current.emit("create-room", { email: userEmail }, (response: any) => {
       if (response.success) {
         setHostRoomCode(response.roomCode);
         setHostPaired(false);

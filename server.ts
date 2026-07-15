@@ -572,8 +572,23 @@ LIMIT 50;
     });
 
     // 1. Create Room (Host / Windows Client / Desktop Simulator)
-    socket.on("create-room", (callback) => {
+    // Supports both the modern `(payload, callback)` and legacy `(callback)` signatures.
+    socket.on("create-room", (arg1, arg2) => {
+      const callback = typeof arg1 === "function" ? arg1 : arg2;
+      const payload = (typeof arg1 === "function" ? {} : arg1) || {};
       try {
+        // Server-side paywall enforcement: the client UI gate can be bypassed by
+        // emitting this event directly, so we re-verify the subscription here.
+        const email = typeof payload.email === "string" ? payload.email.toLowerCase().trim() : "";
+        const sub = email ? subscriptions.get(email) : undefined;
+        if (!sub || sub.status !== "active") {
+          if (callback) callback({
+            success: false,
+            error: "An active Platinum subscription is required to generate a pairing room."
+          });
+          return;
+        }
+
         const code = generateRoomCode();
         rooms.set(code, {
           hostSocketId: socket.id,
@@ -595,7 +610,7 @@ LIMIT 50;
     // 2. Join Room (Mobile / Assistant Client)
     socket.on("join-room", (payload, callback) => {
       try {
-        const { roomCode } = payload;
+        const roomCode = payload && typeof payload.roomCode === "string" ? payload.roomCode.trim() : "";
         if (!roomCode) {
           if (callback) callback({ success: false, error: "Room code required" });
           return;
@@ -607,8 +622,10 @@ LIMIT 50;
           return;
         }
 
-        // Add client to room
-        room.clientSocketIds.push(socket.id);
+        // Add client to room (dedupe to avoid inflated client counts on re-join)
+        if (!room.clientSocketIds.includes(socket.id)) {
+          room.clientSocketIds.push(socket.id);
+        }
         socketToRoom.set(socket.id, roomCode);
         socket.join(`room-${roomCode}`);
 
@@ -654,7 +671,7 @@ LIMIT 50;
       const room = rooms.get(roomCode);
       if (!room) return;
 
-      const { prompt, image, audioTranscript, scenario } = payload;
+      const { prompt, image, audioTranscript, scenario } = payload || {};
       if (scenario) {
         room.scenario = scenario;
       }
@@ -702,9 +719,10 @@ Do not include greetings, explanations of code details, or long intros. Speed is
           }
           contents.push({ text: promptText });
 
-          // Call the modern streaming SDK
+          // Call the modern streaming SDK. Model is configurable so operators can
+          // point at a different Gemini variant without code changes.
           aiResponseStream = await aiClient.models.generateContentStream({
-            model: "gemini-3.5-flash",
+            model: process.env.GEMINI_MODEL || "gemini-3.5-flash",
             contents,
             config: {
               systemInstruction,
@@ -734,9 +752,15 @@ Do not include greetings, explanations of code details, or long intros. Speed is
 
         } catch (err: any) {
           console.error("Gemini API stream error:", err);
-          io.to(`room-${roomCode}`).emit("ai-error", { error: "Gemini API error: " + err.message });
-          // Fall back to high-fidelity simulation if API fails or rate limited
-          await runSimulationFallback(roomCode, room, prompt, audioTranscript);
+          // Degrade gracefully: fall back to high-fidelity simulation instead of
+          // surfacing a hard error to the paired clients. Only report an error if
+          // the fallback itself fails, so a single suggestion is always delivered.
+          try {
+            await runSimulationFallback(roomCode, room, prompt, audioTranscript);
+          } catch (fallbackErr: any) {
+            console.error("Simulation fallback error:", fallbackErr);
+            io.to(`room-${roomCode}`).emit("ai-error", { error: "Suggestion engine temporarily unavailable. Please retry." });
+          }
         }
       } else {
         // Fallback simulation when no API key is specified
