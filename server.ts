@@ -106,6 +106,7 @@ async function startServer() {
       company: string;
       jobDescription: string;
       userCv: string;
+      specialInstructions: string;
     };
     aiInProgress?: boolean;
   }>();
@@ -425,17 +426,34 @@ LIMIT 50;
     company?: string;
     jobDescription?: string;
     userCv?: string;
+    specialInstructions?: string;
   }): string {
     let instruction = `You are "The Interview Helper", an elite real-time interview coach.
 Your job is to help the candidate succeed in a live interview by analyzing the interviewer's questions, screen content, and the candidate's background.
-Deliver an ultra-optimized, condensed cheat-sheet in standard Markdown that the candidate can scan in 3-5 seconds.
-Always structure your output with these specific, scan-friendly sections:
-- **🎯 IDENTIFIED CHALLENGE**: Name the question, topic, or task being discussed.
-- **💡 OPTIMAL STRATEGY**: 2-3 bullet points with the best approach, complexity, data structures, or frameworks to mention.
-- **💻 GOLDEN CODE**: A minimal, clean code snippet when relevant (match the language in the question or job description).
-- **🗣️ TALKING POINTS**: 2 bullet points the candidate can say aloud — tie answers to their CV experience when relevant.
 
-Do not include greetings or long intros. Speed is everything. Keep the total length short and scannable.`;
+ANSWER FORMAT — always use this structure in Markdown:
+
+### 🎯 IDENTIFIED QUESTION
+One line naming the question or task.
+
+### ⭐ STAR RESPONSE
+For behavioral, situational, and experience questions, answer using STAR with bullets tied to the candidate's CV:
+- **Situation**: Brief context from a relevant role/project (prefer CV examples).
+- **Task**: What you were responsible for.
+- **Action**: Specific steps you took (use "I" statements the candidate can speak aloud).
+- **Result**: Quantified outcome or impact when possible.
+
+For technical/coding/screen questions, still include STAR when explaining approach, plus:
+### 💡 TECHNICAL STRATEGY
+2-3 bullets: approach, complexity, data structures, or architecture.
+
+### 💻 GOLDEN CODE (when relevant)
+Minimal clean code matching the question language.
+
+### 🗣️ SAY THIS ALOUD
+2 short bullet lines the candidate can read verbatim in the interview.
+
+Rules: No greetings. Scannable in 5-8 seconds. Be accurate to the candidate's seniority and the job description.`;
 
     if (profile?.targetPosition?.trim()) {
       instruction += `\n\n--- CANDIDATE TARGET ROLE ---\nPosition: ${profile.targetPosition.trim()}`;
@@ -448,7 +466,10 @@ Do not include greetings or long intros. Speed is everything. Keep the total len
       if (profile.userCv?.trim()) {
         instruction += `\n\n--- CANDIDATE CV / RESUME ---\n${profile.userCv.trim().slice(0, LIMITS.MAX_CV_CHARS)}`;
       }
-      instruction += `\n\nTailor every answer to this role and job requirements. Prefer examples from the candidate's CV in talking points. Match seniority and tech stack from the job description.`;
+      if (profile.specialInstructions?.trim()) {
+        instruction += `\n\n--- SPECIAL INSTRUCTIONS ---\n${profile.specialInstructions.trim().slice(0, LIMITS.MAX_SPECIAL_INSTRUCTIONS_CHARS)}`;
+      }
+      instruction += `\n\nTailor every STAR example to this role. Pull Situation/Action/Result from the CV when possible. Match seniority and tech stack from the job description.`;
     }
 
     return instruction;
@@ -1193,6 +1214,7 @@ Do not include greetings or long intros. Speed is everything. Keep the total len
           company: String(interviewProfile.company || "").slice(0, 100),
           jobDescription: String(interviewProfile.jobDescription || "").slice(0, LIMITS.MAX_JOB_DESCRIPTION_CHARS),
           userCv: String(interviewProfile.userCv || "").slice(0, LIMITS.MAX_CV_CHARS),
+          specialInstructions: String(interviewProfile.specialInstructions || "").slice(0, LIMITS.MAX_SPECIAL_INSTRUCTIONS_CHARS),
         };
         room.scenario = {
           title: room.profile.targetPosition || "Interview Session",
@@ -1512,6 +1534,7 @@ function streamState(screenshotBase64: string, transcript: string) {
   // Vite development integration (local dev only — production bundle serves /dist)
   if (!isProduction) {
     console.log("Starting development mode with Vite HMR middleware...");
+    app.use("/downloads", express.static(path.join(process.cwd(), "public", "downloads")));
     const vite = await createViteServer({
       server: {
         middlewareMode: true,
@@ -1528,7 +1551,11 @@ function streamState(screenshotBase64: string, transcript: string) {
       process.exit(1);
     }
     app.use(express.static(distPath));
-    app.get("*", (req, res) => {
+    app.use("/downloads", express.static(path.join(process.cwd(), "public", "downloads")));
+    app.get("*", (req, res, next) => {
+      if (req.path.startsWith("/api/")) {
+        return next();
+      }
       res.sendFile(path.join(distPath, "index.html"));
     });
   }

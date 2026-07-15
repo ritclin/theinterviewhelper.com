@@ -21,6 +21,7 @@ const EMPTY_PROFILE: InterviewProfile = {
   company: "",
   jobDescription: "",
   userCv: "",
+  specialInstructions: "",
 };
 
 function loadSavedProfile(): InterviewProfile {
@@ -34,6 +35,7 @@ function loadSavedProfile(): InterviewProfile {
       company: parsed.company || "",
       jobDescription: parsed.jobDescription || "",
       userCv: parsed.userCv || "",
+      specialInstructions: parsed.specialInstructions || "",
     };
   } catch {
     return EMPTY_PROFILE;

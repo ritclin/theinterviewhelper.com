@@ -4,9 +4,7 @@ import {
   Text,
   TextInput,
   TouchableOpacity,
-  ScrollView,
   StyleSheet,
-  Platform,
 } from "react-native";
 import * as DocumentPicker from "expo-document-picker";
 import * as FileSystem from "expo-file-system";
@@ -16,6 +14,7 @@ export type InterviewProfile = {
   company: string;
   jobDescription: string;
   userCv: string;
+  specialInstructions: string;
 };
 
 type Props = {
@@ -38,30 +37,36 @@ export function InterviewProfileForm({
   const importCvFile = async () => {
     try {
       const result = await DocumentPicker.getDocumentAsync({
-        type: ["text/plain", "application/pdf"],
+        type: ["text/plain", "application/pdf", "application/msword",
+          "application/vnd.openxmlformats-officedocument.wordprocessingml.document"],
         copyToCacheDirectory: true,
       });
       if (result.canceled || !result.assets?.[0]) return;
       const asset = result.assets[0];
-      if (asset.mimeType === "text/plain" || asset.name?.endsWith(".txt")) {
+      const name = asset.name || "cv";
+      if (
+        asset.mimeType === "text/plain" ||
+        name.endsWith(".txt") ||
+        name.endsWith(".md")
+      ) {
         const text = await FileSystem.readAsStringAsync(asset.uri);
         update("userCv", text.slice(0, 12000));
       } else {
         update(
           "userCv",
-          `${profile.userCv}\n\n[Uploaded file: ${asset.name}. Paste CV text manually if PDF.]`.trim()
+          `${profile.userCv}\n\n[Uploaded: ${name} — paste CV text here if PDF/DOCX could not be read.]`.trim()
         );
       }
     } catch {
-      // User cancelled or file unreadable
+      // cancelled
     }
   };
 
   return (
-    <ScrollView style={styles.container} keyboardShouldPersistTaps="handled">
+    <View style={styles.container}>
       <Text style={styles.title}>Your Interview Profile</Text>
       <Text style={styles.subtitle}>
-        Position, job description, and CV tailor AI answers to you and the role.
+        These fields personalize every answer. Behavioral questions use the STAR method (Situation, Task, Action, Result).
       </Text>
 
       <Text style={styles.label}>Position interviewing for *</Text>
@@ -87,7 +92,7 @@ export function InterviewProfileForm({
         style={[styles.input, styles.textArea]}
         value={profile.jobDescription}
         onChangeText={(v) => update("jobDescription", v)}
-        placeholder="Paste responsibilities, skills, tech stack..."
+        placeholder="Paste responsibilities, skills, tech stack, seniority..."
         placeholderTextColor="#475569"
         multiline
       />
@@ -95,19 +100,29 @@ export function InterviewProfileForm({
       <View style={styles.cvHeader}>
         <Text style={styles.label}>Your CV / Resume</Text>
         <TouchableOpacity onPress={importCvFile} style={styles.uploadBtn}>
-          <Text style={styles.uploadBtnText}>Upload file</Text>
+          <Text style={styles.uploadBtnText}>Upload CV</Text>
         </TouchableOpacity>
       </View>
       <TextInput
         style={[styles.input, styles.textArea]}
         value={profile.userCv}
         onChangeText={(v) => update("userCv", v)}
-        placeholder="Paste or upload your CV..."
+        placeholder="Paste or upload CV — STAR answers will reference your experience here..."
         placeholderTextColor="#475569"
         multiline
       />
 
-      <Text style={styles.label}>Live interviewer question</Text>
+      <Text style={styles.label}>Special instructions for AI</Text>
+      <TextInput
+        style={[styles.input, styles.textAreaSmall]}
+        value={profile.specialInstructions}
+        onChangeText={(v) => update("specialInstructions", v)}
+        placeholder="e.g. Always use STAR, emphasize leadership, keep answers under 90 sec, focus on Python..."
+        placeholderTextColor="#475569"
+        multiline
+      />
+
+      <Text style={styles.label}>Live interviewer question (optional)</Text>
       <TextInput
         style={[styles.input, styles.textAreaSmall]}
         value={liveTranscript}
@@ -116,12 +131,12 @@ export function InterviewProfileForm({
         placeholderTextColor="#475569"
         multiline
       />
-    </ScrollView>
+    </View>
   );
 }
 
 const styles = StyleSheet.create({
-  container: { flex: 1 },
+  container: { marginBottom: 8 },
   title: { color: "#f8fafc", fontSize: 16, fontWeight: "bold", marginBottom: 4 },
   subtitle: { color: "#64748b", fontSize: 11, lineHeight: 16, marginBottom: 16 },
   label: {

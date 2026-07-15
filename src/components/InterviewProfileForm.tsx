@@ -94,6 +94,19 @@ export function InterviewProfileForm({
 
       <div>
         <label className="block text-[11px] font-semibold text-slate-300 mb-1.5 uppercase tracking-wider">
+          Special instructions for AI
+        </label>
+        <textarea
+          value={profile.specialInstructions}
+          onChange={(e) => update("specialInstructions", e.target.value)}
+          placeholder="e.g. Use STAR for behavioral questions, emphasize leadership, keep answers under 90 seconds, focus on Python..."
+          rows={3}
+          className="w-full bg-slate-950 border border-slate-800 focus:border-indigo-500 rounded-lg px-3 py-2 text-xs text-slate-200 outline-none resize-y"
+        />
+      </div>
+
+      <div>
+        <label className="block text-[11px] font-semibold text-slate-300 mb-1.5 uppercase tracking-wider">
           Live interviewer question / transcript
         </label>
         <textarea

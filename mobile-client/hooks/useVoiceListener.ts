@@ -54,6 +54,13 @@ export function useVoiceListener({
   const recordLoop = useCallback(async () => {
     while (loopRef.current) {
       try {
+        const permission = await Audio.requestPermissionsAsync();
+        if (!permission.granted) {
+          onError?.("Microphone permission required to listen to the interview.");
+          loopRef.current = false;
+          break;
+        }
+
         await Audio.setAudioModeAsync({
           allowsRecordingIOS: true,
           playsInSilentModeIOS: true,
@@ -63,20 +70,7 @@ export function useVoiceListener({
         });
 
         const recording = new Audio.Recording();
-        await recording.prepareToRecordAsync({
-          ...Audio.RecordingOptionsPresets.HIGH_QUALITY,
-          android: {
-            ...Audio.RecordingOptionsPresets.HIGH_QUALITY.android,
-            extension: ".m4a",
-            outputFormat: Audio.AndroidOutputFormat.MPEG_4,
-            audioEncoder: Audio.AndroidAudioEncoder.AAC,
-          },
-          ios: {
-            ...Audio.RecordingOptionsPresets.HIGH_QUALITY.ios,
-            extension: ".m4a",
-            outputFormat: Audio.IOSOutputFormat.MPEG4AAC,
-          },
-        });
+        await recording.prepareToRecordAsync(Audio.RecordingOptionsPresets.HIGH_QUALITY);
         recordingRef.current = recording;
         await recording.startAsync();
         setIsListening(true);
@@ -97,9 +91,9 @@ export function useVoiceListener({
             // ignore
           }
         }
-      } catch (err) {
+      } catch {
         setIsListening(false);
-        onError?.("Microphone access failed. Keep phone near laptop speakers.");
+        onError?.("Microphone error. Keep phone near laptop speakers.");
         loopRef.current = false;
         break;
       }

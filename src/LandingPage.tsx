@@ -258,9 +258,9 @@ export default function LandingPage() {
               "Listens to interview voice",
               "Shows answers on your phone",
             ]}
-            primaryLabel={downloads.androidApk ? "Download APK" : "Get Android app"}
+            primaryLabel={downloads.androidApk ? "Download Android APK" : "Get Android app"}
             primaryHref={downloads.androidApk || "#android-install"}
-            secondaryLabel={downloads.androidPlayStore ? "Google Play Store" : "Expo / EAS build"}
+            secondaryLabel={downloads.androidPlayStore ? "Google Play Store" : "Direct APK install (enable Unknown sources)"}
             secondaryHref={downloads.androidPlayStore || undefined}
           />
         </div>

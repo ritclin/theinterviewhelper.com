@@ -138,7 +138,15 @@ dist\InterviewHelperCapture.exe --room 123456 --stealth
 
 **Hotkey:** `Ctrl+Shift+Space` — captures the screen and sends it to your phone. If auto-analyze is enabled on Android, AI answers start immediately.
 
-### End-to-end flow
+### Download links (after deploy)
+
+| File | URL |
+|------|-----|
+| **Android APK** | `/downloads/interview-helper.apk` |
+| **Windows package** | `/downloads/interview-helper-windows.zip` |
+| **Windows .exe** | `/downloads/InterviewHelperCapture.exe` (built by GitHub Actions on Windows) |
+
+Rebuild Android APK locally: `bash scripts/build-android-apk.sh`
 
 ```
 Subscribe (/subscribe) → Android: profile + start session → Windows: install with room code

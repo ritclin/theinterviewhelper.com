@@ -8,6 +8,14 @@
     "splash": {
       "backgroundColor": "#020617"
     },
+    "plugins": [
+      [
+        "expo-av",
+        {
+          "microphonePermission": "Allow Interview Helper to listen to interview questions from your laptop speakers."
+        }
+      ]
+    ],
     "assetBundlePatterns": ["**/*"],
     "ios": {
       "supportsTablet": true,

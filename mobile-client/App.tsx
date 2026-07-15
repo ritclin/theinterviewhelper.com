@@ -36,6 +36,7 @@ const EMPTY_PROFILE: InterviewProfile = {
   company: "",
   jobDescription: "",
   userCv: "",
+  specialInstructions: "",
 };
 
 type HistoryItem = { role: string; content: string; timestamp: string };
@@ -201,7 +202,7 @@ export default function App() {
         image: image || undefined,
         audioTranscript: transcript || liveTranscript || undefined,
         interviewProfile: profile,
-        prompt: "Analyze the screen content and provide the best interview answer for this candidate.",
+        prompt: "Provide a STAR-format interview answer tailored to this candidate. For coding questions include strategy and code.",
         timestamp: Date.now(),
       });
     },
@@ -408,10 +409,16 @@ export default function App() {
       return block.value.split("\n").map((line, li) => {
         const t = line.trim();
         if (!t) return <View key={`${key}-${li}`} style={{ height: 6 }} />;
-        if (t.startsWith("### "))
+        if (t.startsWith("### ") || t.startsWith("⭐"))
           return (
             <Text key={`${key}-${li}`} style={styles.h3}>
-              {t.slice(4)}
+              {t.replace(/^###\s*/, "")}
+            </Text>
+          );
+        if (t.startsWith("**Situation") || t.startsWith("**Task") || t.startsWith("**Action") || t.startsWith("**Result"))
+          return (
+            <Text key={`${key}-${li}`} style={styles.starLine}>
+              {t.replace(/\*\*/g, "")}
             </Text>
           );
         if (t.startsWith("* ") || t.startsWith("- "))
@@ -720,6 +727,7 @@ const styles = StyleSheet.create({
   copyText: { color: "#818cf8", fontSize: 10 },
   codeText: { color: "#cbd5e1", fontFamily: Platform.OS === "ios" ? "Courier" : "monospace", fontSize: 11, padding: 10 },
   h3: { color: "#fff", fontSize: 14, fontWeight: "bold", marginTop: 10, marginBottom: 4 },
+  starLine: { color: "#c7d2fe", fontSize: 12, lineHeight: 18, marginBottom: 4, marginLeft: 4 },
   bullet: { color: "#94a3b8", fontSize: 12, lineHeight: 18, marginLeft: 4, marginBottom: 4 },
   body: { color: "#cbd5e1", fontSize: 12, lineHeight: 18, marginBottom: 6 },
 });
