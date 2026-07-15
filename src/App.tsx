@@ -10,7 +10,8 @@ import {
   CheckCircle2, AlertCircle, ArrowRight, Code, MessageSquare, 
   Clock, ArrowUpRight, Lock, User, CreditCard, RefreshCw, Eye,
   Send, Terminal, Plus, HelpCircle, Key, Calendar, Trash2, 
-  TrendingUp, Search, FileText, Copy, Check, Database, Activity, Download
+  TrendingUp, Search, FileText, Copy, Check, Database, Activity, Download,
+  History
 } from "lucide-react";
 import { INTERVIEW_SCENARIOS } from "./scenarios";
 import { InterviewScenario, SuggestionHistoryItem } from "./types";
