@@ -75,29 +75,75 @@ Cloud platforms (Cloud Run, Railway, Render, Fly.io) can use the included `Docke
 
 ## Companion clients
 
-After deploying the relay server, point clients at your public URL instead of `localhost`:
+### 1. Subscribe (required — €20/month)
 
-- **Web dashboard**: uses the same origin automatically
-- **Windows client**: `python client.py --server https://your-app.example.com`
-- **Mobile client (Expo)**: defaults to the production relay URL; enter the 6-digit room code from the web dashboard
+Open **`/subscribe`** on your deployed site (e.g. `https://theinterviewhelpercom-production.up.railway.app/subscribe`), pay with Stripe, and use the **same email** everywhere.
 
-### Android companion (view AI answers on your phone)
+Pairing and AI answers are **blocked server-side** until subscription is active.
 
-1. Generate a room code on the web dashboard (same subscription session).
-2. On your Android device, install [Expo Go](https://play.google.com/store/apps/details?id=host.exp.exponent) from the Play Store.
-3. From the repo root:
+### 2. Android app (host + personalized AI)
+
+The Android app is the **session host**: it creates the room, stores your profile (position, job description, CV), and displays AI answers.
+
+**Option A — Expo Go (quick test)**
+
+```bash
+cd mobile-client && npm install && npx expo start
+```
+
+Scan the QR code with Expo Go on Android.
+
+**Option B — Standalone APK (recommended for interviews)**
 
 ```bash
 cd mobile-client
-npm install
-npx expo start
+npm install -g eas-cli
+eas login
+eas build -p android --profile preview
 ```
 
-4. Scan the QR code with Expo Go (Android) or press `a` in the terminal if an emulator is connected.
-5. Enter the **6-digit room code** and tap **Link Session**.
-6. Trigger AI assist from the web dashboard or Windows capture client — answers stream to the phone in real time.
+Install the downloaded APK on your phone.
 
-The app keeps the screen awake during interviews and shows live streaming answers plus previous answer history.
+**In the app:**
+
+1. Enter your **billing email** → Check subscription
+2. Fill in **position, job description, CV** (paste or upload `.txt`)
+3. Tap **Start pairing session** → note the **6-digit room code**
+4. Open the **Live answers** tab during the interview
+
+### 3. Windows stealth capture (.exe)
+
+Captures **full-screen** interview questions and sends them to your Android app. Runs hidden in the system tray.
+
+**Build on Windows (once):**
+
+```powershell
+cd windows-client
+powershell -ExecutionPolicy Bypass -File build.ps1
+```
+
+**Silent install + auto-start on login:**
+
+```powershell
+powershell -ExecutionPolicy Bypass -File install.ps1 -RoomCode 123456
+```
+
+Replace `123456` with the code shown in the Android app.
+
+**Manual run:**
+
+```powershell
+dist\InterviewHelperCapture.exe --room 123456 --stealth
+```
+
+**Hotkey:** `Ctrl+Shift+Space` — captures the screen and sends it to your phone. If auto-analyze is enabled on Android, AI answers start immediately.
+
+### End-to-end flow
+
+```
+Subscribe (/subscribe) → Android: profile + start session → Windows: install with room code
+→ Ctrl+Shift+Space during interview → screenshot on phone → personalized AI answer
+```
 
 ## Health check
 

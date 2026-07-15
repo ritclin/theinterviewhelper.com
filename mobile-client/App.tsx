@@ -12,87 +12,160 @@ import {
   SafeAreaView,
   StatusBar,
   Alert,
+  Image,
+  Switch,
 } from "react-native";
 import AsyncStorage from "@react-native-async-storage/async-storage";
 import { useKeepAwake } from "expo-keep-awake";
 import { io, Socket } from "socket.io-client";
+import { InterviewProfileForm, InterviewProfile } from "./components/InterviewProfileForm";
 
 const DEFAULT_SERVER_URL = "https://theinterviewhelpercom-production.up.railway.app";
-const STORAGE_SERVER_URL = "tih_mobile_server_url";
-const STORAGE_ROOM_CODE = "tih_mobile_room_code";
+const STORAGE_KEYS = {
+  server: "tih_mobile_server_url",
+  email: "tih_mobile_email",
+  profile: "tih_interview_profile",
+  autoAnalyze: "tih_auto_analyze",
+};
 
-const Icons = {
-  Sparkles: () => <Text style={{ fontSize: 18, color: "#818cf8" }}>✨</Text>,
-  Code: () => <Text style={{ fontSize: 14, color: "#818cf8" }}>💻</Text>,
-  Check: () => <Text style={{ fontSize: 14, color: "#34d399" }}>✅</Text>,
-  Copy: () => <Text style={{ fontSize: 14, color: "#94a3b8" }}>📋</Text>,
-  Lock: () => <Text style={{ fontSize: 16, color: "#f43f5e" }}>🔒</Text>,
+const EMPTY_PROFILE: InterviewProfile = {
+  targetPosition: "",
+  company: "",
+  jobDescription: "",
+  userCv: "",
 };
 
 type HistoryItem = { role: string; content: string; timestamp: string };
+type SubscriptionStatus = { status: "active" | "canceled" | "none"; email: string; currentPeriodEnd: number };
 
 export default function App() {
   useKeepAwake();
 
   const socketRef = useRef<Socket | null>(null);
   const scrollViewRef = useRef<ScrollView>(null);
+  const pendingImageRef = useRef<string | null>(null);
 
   const [serverUrl, setServerUrl] = useState(DEFAULT_SERVER_URL);
+  const [email, setEmail] = useState("");
+  const [subscription, setSubscription] = useState<SubscriptionStatus | null>(null);
+  const [checkingSub, setCheckingSub] = useState(false);
+
+  const [profile, setProfile] = useState<InterviewProfile>(EMPTY_PROFILE);
+  const [liveTranscript, setLiveTranscript] = useState("");
+  const [autoAnalyze, setAutoAnalyze] = useState(true);
+
   const [roomCode, setRoomCode] = useState("");
-  const [isConnected, setIsConnected] = useState(false);
-  const [isPaired, setIsPaired] = useState(false);
+  const [isSessionActive, setIsSessionActive] = useState(false);
   const [isConnecting, setIsConnecting] = useState(false);
   const [connectionError, setConnectionError] = useState("");
 
-  const [screenshotText, setScreenshotText] = useState("");
+  const [activeTab, setActiveTab] = useState<"setup" | "live">("setup");
+  const [screenshotUri, setScreenshotUri] = useState<string | null>(null);
   const [screenshotName, setScreenshotName] = useState("");
-  const [speechTranscript, setSpeechTranscript] = useState("");
 
   const [suggestionStream, setSuggestionStream] = useState("");
   const [isAiStreaming, setIsAiStreaming] = useState(false);
   const [aiError, setAiError] = useState("");
   const [history, setHistory] = useState<HistoryItem[]>([]);
-
   const [copiedIndex, setCopiedIndex] = useState<number | null>(null);
   const [prefsLoaded, setPrefsLoaded] = useState(false);
 
   const scrollToLatest = useCallback(() => {
-    requestAnimationFrame(() => {
-      scrollViewRef.current?.scrollToEnd({ animated: true });
-    });
+    requestAnimationFrame(() => scrollViewRef.current?.scrollToEnd({ animated: true }));
   }, []);
 
   useEffect(() => {
-    let cancelled = false;
     (async () => {
       try {
-        const [savedUrl, savedRoom] = await Promise.all([
-          AsyncStorage.getItem(STORAGE_SERVER_URL),
-          AsyncStorage.getItem(STORAGE_ROOM_CODE),
+        const [savedUrl, savedEmail, savedProfile, savedAuto] = await Promise.all([
+          AsyncStorage.getItem(STORAGE_KEYS.server),
+          AsyncStorage.getItem(STORAGE_KEYS.email),
+          AsyncStorage.getItem(STORAGE_KEYS.profile),
+          AsyncStorage.getItem(STORAGE_KEYS.autoAnalyze),
         ]);
-        if (cancelled) return;
         if (savedUrl?.trim()) setServerUrl(savedUrl.trim());
-        if (savedRoom?.trim()) setRoomCode(savedRoom.trim());
-      } catch {
-        // Non-fatal; defaults are fine.
+        if (savedEmail?.trim()) setEmail(savedEmail.trim());
+        if (savedProfile) {
+          const parsed = JSON.parse(savedProfile);
+          setProfile({ ...EMPTY_PROFILE, ...parsed });
+        }
+        if (savedAuto === "0") setAutoAnalyze(false);
       } finally {
-        if (!cancelled) setPrefsLoaded(true);
+        setPrefsLoaded(true);
       }
     })();
-    return () => {
-      cancelled = true;
-    };
   }, []);
 
   useEffect(() => {
     if (!prefsLoaded) return;
-    AsyncStorage.setItem(STORAGE_SERVER_URL, serverUrl.trim()).catch(() => {});
-  }, [serverUrl, prefsLoaded]);
+    AsyncStorage.multiSet([
+      [STORAGE_KEYS.server, serverUrl.trim()],
+      [STORAGE_KEYS.email, email.trim()],
+      [STORAGE_KEYS.profile, JSON.stringify(profile)],
+      [STORAGE_KEYS.autoAnalyze, autoAnalyze ? "1" : "0"],
+    ]).catch(() => {});
+  }, [serverUrl, email, profile, autoAnalyze, prefsLoaded]);
 
-  useEffect(() => {
-    if (!prefsLoaded) return;
-    AsyncStorage.setItem(STORAGE_ROOM_CODE, roomCode.trim()).catch(() => {});
-  }, [roomCode, prefsLoaded]);
+  const fetchSubscription = async (targetEmail: string): Promise<SubscriptionStatus | null> => {
+    try {
+      const base = serverUrl.replace(/\/$/, "");
+      const res = await fetch(`${base}/api/stripe/status?email=${encodeURIComponent(targetEmail)}`);
+      const data = await res.json();
+      if (data.success) return data as SubscriptionStatus;
+    } catch {
+      // ignore
+    }
+    return null;
+  };
+
+  const checkSubscription = async () => {
+    const target = email.trim().toLowerCase();
+    if (!target) {
+      Alert.alert("Email required", "Enter the same email you used for payment.");
+      return false;
+    }
+    setCheckingSub(true);
+    const sub = await fetchSubscription(target);
+    setCheckingSub(false);
+    if (sub) setSubscription(sub);
+    if (sub?.status === "active") return true;
+    Alert.alert(
+      "Subscription required",
+      "No active €20/month subscription found. Subscribe at /subscribe on the website, then tap Refresh subscription.",
+      [{ text: "OK" }]
+    );
+    return false;
+  };
+
+  const syncSubscription = async () => {
+    const target = email.trim().toLowerCase();
+    if (!target) return;
+    setCheckingSub(true);
+    try {
+      const base = serverUrl.replace(/\/$/, "");
+      const res = await fetch(`${base}/api/stripe/sync-subscription`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ email: target }),
+      });
+      const data = await res.json();
+      if (data.success && data.subscription) {
+        setSubscription(data.subscription);
+        Alert.alert("Success", "Subscription synced from Stripe.");
+      } else {
+        Alert.alert("Not found", data.error || "No active subscription for this email.");
+      }
+    } catch {
+      Alert.alert("Error", "Could not reach billing server.");
+    } finally {
+      setCheckingSub(false);
+    }
+  };
+
+  const openSubscribePage = () => {
+    const base = serverUrl.replace(/\/$/, "");
+    Alert.alert("Subscribe", `Open ${base}/subscribe in your browser to pay €20/month.`);
+  };
 
   const teardownSocket = useCallback(() => {
     const socket = socketRef.current;
@@ -102,65 +175,59 @@ export default function App() {
     socketRef.current = null;
   }, []);
 
-  useEffect(() => {
-    return () => {
-      teardownSocket();
-    };
-  }, [teardownSocket]);
+  useEffect(() => () => teardownSocket(), [teardownSocket]);
 
-  useEffect(() => {
-    scrollToLatest();
-  }, [suggestionStream, history, scrollToLatest]);
-
-  const resetSessionState = useCallback(() => {
-    setIsPaired(false);
-    setIsConnected(false);
-    setIsConnecting(false);
-    setIsAiStreaming(false);
-    setSuggestionStream("");
-    setHistory([]);
-    setScreenshotText("");
-    setSpeechTranscript("");
-    setScreenshotName("");
-    setAiError("");
-    setConnectionError("");
-  }, []);
-
-  const handleDisconnect = useCallback(() => {
-    teardownSocket();
-    resetSessionState();
-  }, [resetSessionState, teardownSocket]);
+  const requestAiAssist = useCallback(
+    (image?: string | null, transcript?: string) => {
+      const socket = socketRef.current;
+      if (!socket?.connected) return;
+      if (!profile.targetPosition.trim()) {
+        Alert.alert("Profile required", "Set your target position before requesting AI answers.");
+        setActiveTab("setup");
+        return;
+      }
+      socket.emit("request-ai-assist", {
+        image: image || undefined,
+        audioTranscript: transcript || liveTranscript || undefined,
+        interviewProfile: profile,
+        prompt: "Analyze the screen content and provide the best interview answer for this candidate.",
+        timestamp: Date.now(),
+      });
+    },
+    [profile, liveTranscript]
+  );
 
   const registerSocketListeners = useCallback(
     (socket: Socket) => {
       socket.on("connect", () => {
-        setIsConnected(true);
         setConnectionError("");
-        console.log("Connected to relay server:", socket.id);
-
-        socket.emit("join-room", { roomCode }, (response: { success?: boolean; error?: string; history?: HistoryItem[] }) => {
+        socket.emit("create-room", { email: email.trim().toLowerCase() }, (response: any) => {
           setIsConnecting(false);
           if (response?.success) {
-            setIsPaired(true);
-            setHistory(response.history || []);
+            setRoomCode(response.roomCode);
+            setIsSessionActive(true);
+            setActiveTab("live");
+            setHistory([]);
             setSuggestionStream("");
             setAiError("");
-            setScreenshotText("");
-            setSpeechTranscript("");
-            setScreenshotName("");
           } else {
-            const message = response?.error || "Could not join room.";
-            setConnectionError(message);
-            Alert.alert("Pairing Failed", message);
+            const msg = response?.error || "Could not start session.";
+            setConnectionError(msg);
+            if (response?.code === "SUBSCRIPTION_REQUIRED") {
+              Alert.alert("Subscription required", msg, [
+                { text: "Refresh", onPress: syncSubscription },
+                { text: "OK" },
+              ]);
+            } else {
+              Alert.alert("Session failed", msg);
+            }
             teardownSocket();
-            setIsConnected(false);
           }
         });
       });
 
       socket.on("disconnect", () => {
-        setIsConnected(false);
-        setIsPaired(false);
+        setIsSessionActive(false);
         setIsConnecting(false);
         setIsAiStreaming(false);
       });
@@ -170,14 +237,16 @@ export default function App() {
         setConnectionError(err.message || "Connection failed.");
       });
 
-      socket.on("paired", () => {
-        setIsPaired(true);
-      });
-
-      socket.on("stream-feed", (payload: { imageText?: string; imageName?: string; audioTranscript?: string }) => {
-        if (payload.imageText) setScreenshotText(payload.imageText);
+      socket.on("stream-feed", (payload: { image?: string; imageName?: string; imageText?: string; audioTranscript?: string }) => {
         if (payload.imageName) setScreenshotName(payload.imageName);
-        if (payload.audioTranscript) setSpeechTranscript(payload.audioTranscript);
+        if (payload.audioTranscript) setLiveTranscript(payload.audioTranscript);
+        if (payload.image) {
+          setScreenshotUri(payload.image);
+          pendingImageRef.current = payload.image;
+          if (autoAnalyze) {
+            requestAiAssist(payload.image, payload.audioTranscript);
+          }
+        }
       });
 
       socket.on("ai-start", () => {
@@ -197,162 +266,127 @@ export default function App() {
         if (fullText.trim()) {
           setHistory((prev) => [
             ...prev,
-            {
-              role: "assistant",
-              content: fullText,
-              timestamp: new Date().toLocaleTimeString(),
-            },
+            { role: "assistant", content: fullText, timestamp: new Date().toLocaleTimeString() },
           ]);
         }
         setSuggestionStream("");
       });
 
-      socket.on("ai-error", (data: { error?: string }) => {
+      socket.on("ai-error", (data: { error?: string; code?: string }) => {
         setIsAiStreaming(false);
         setSuggestionStream("");
-        const message = data.error || "AI suggestion failed.";
-        setAiError(message);
-      });
-
-      socket.on("room-closed", () => {
-        Alert.alert("Session Ended", "Host client disconnected. Pairing ended.");
-        handleDisconnect();
+        setAiError(data.error || "AI failed.");
+        if (data.code === "SUBSCRIPTION_REQUIRED") {
+          Alert.alert("Subscription expired", data.error || "Renew at /subscribe");
+        }
       });
 
       socket.on("room-expired", () => {
-        Alert.alert("Session Expired", "This room session has expired.");
-        handleDisconnect();
+        Alert.alert("Session expired", "Start a new session.");
+        endSession();
       });
     },
-    [roomCode, teardownSocket, handleDisconnect]
+    [email, autoAnalyze, requestAiAssist, teardownSocket]
   );
 
-  const handleConnectAndJoin = () => {
-    const trimmedUrl = serverUrl.trim();
-    const trimmedCode = roomCode.trim();
-
-    if (!trimmedUrl) {
-      Alert.alert("Server URL Required", "Enter the relay server URL.");
-      return;
-    }
-    if (trimmedCode.length !== 6) {
-      Alert.alert("Invalid Code", "Please enter a valid 6-digit active room code.");
+  const startSession = async () => {
+    if (!(await checkSubscription())) return;
+    if (!profile.targetPosition.trim()) {
+      Alert.alert("Profile", "Enter the position you are interviewing for.");
+      setActiveTab("setup");
       return;
     }
 
     teardownSocket();
     setIsConnecting(true);
     setConnectionError("");
-    setAiError("");
-    setIsPaired(false);
 
-    const socket = io(trimmedUrl, {
+    const socket = io(serverUrl.replace(/\/$/, ""), {
       transports: ["websocket", "polling"],
       reconnectionAttempts: 8,
-      reconnectionDelay: 1000,
       timeout: 15000,
     });
-
     socketRef.current = socket;
     registerSocketListeners(socket);
   };
 
-  const handleCopyToClipboard = (text: string, index: number) => {
+  const endSession = () => {
+    teardownSocket();
+    setIsSessionActive(false);
+    setRoomCode("");
+    setScreenshotUri(null);
+    setSuggestionStream("");
+    setHistory([]);
+    setAiError("");
+  };
+
+  useEffect(() => {
+    scrollToLatest();
+  }, [suggestionStream, history, scrollToLatest]);
+
+  const handleCopy = (text: string, index: number) => {
     Clipboard.setString(text);
     setCopiedIndex(index);
     setTimeout(() => setCopiedIndex(null), 2000);
   };
 
-  const renderMarkdownBlocks = (markdownText: string, keyPrefix: string) => {
-    const blocks: Array<{ type: string; value: string; language?: string; isIncomplete?: boolean }> = [];
-    let currentIndex = 0;
-
-    while (true) {
-      const startIndex = markdownText.indexOf("```", currentIndex);
-      if (startIndex === -1) {
-        if (currentIndex < markdownText.length) {
-          blocks.push({ type: "text", value: markdownText.substring(currentIndex) });
-        }
+  const renderMarkdown = (markdownText: string, prefix: string) => {
+    const blocks: Array<{ type: string; value: string; language?: string }> = [];
+    let idx = 0;
+    while (idx < markdownText.length) {
+      const start = markdownText.indexOf("```", idx);
+      if (start === -1) {
+        blocks.push({ type: "text", value: markdownText.slice(idx) });
         break;
       }
-
-      if (startIndex > currentIndex) {
-        blocks.push({ type: "text", value: markdownText.substring(currentIndex, startIndex) });
-      }
-
-      const endIndex = markdownText.indexOf("```", startIndex + 3);
-      if (endIndex === -1) {
-        const blockContent = markdownText.substring(startIndex + 3);
-        const newlineIdx = blockContent.indexOf("\n");
-        const lang = newlineIdx !== -1 ? blockContent.substring(0, newlineIdx).trim() : "";
-        const code = newlineIdx !== -1 ? blockContent.substring(newlineIdx + 1) : blockContent;
-        blocks.push({ type: "code", language: lang, value: code, isIncomplete: true });
+      if (start > idx) blocks.push({ type: "text", value: markdownText.slice(idx, start) });
+      const end = markdownText.indexOf("```", start + 3);
+      if (end === -1) {
+        blocks.push({ type: "code", value: markdownText.slice(start + 3), language: "" });
         break;
       }
-
-      const blockContent = markdownText.substring(startIndex + 3, endIndex);
-      const newlineIdx = blockContent.indexOf("\n");
-      const lang = newlineIdx !== -1 ? blockContent.substring(0, newlineIdx).trim() : "";
-      const code = newlineIdx !== -1 ? blockContent.substring(newlineIdx + 1) : blockContent;
-      blocks.push({ type: "code", language: lang, value: code, isIncomplete: false });
-      currentIndex = endIndex + 3;
+      const inner = markdownText.slice(start + 3, end);
+      const nl = inner.indexOf("\n");
+      const lang = nl >= 0 ? inner.slice(0, nl).trim() : "";
+      const code = nl >= 0 ? inner.slice(nl + 1) : inner;
+      blocks.push({ type: "code", value: code, language: lang });
+      idx = end + 3;
     }
 
-    return blocks.map((block, idx) => {
-      const blockKey = `${keyPrefix}-${idx}`;
+    return blocks.map((block, bi) => {
+      const key = `${prefix}-${bi}`;
       if (block.type === "code") {
         return (
-          <View key={blockKey} style={styles.codeContainer}>
+          <View key={key} style={styles.codeBox}>
             <View style={styles.codeHeader}>
-              <View style={styles.row}>
-                <Icons.Code />
-                <Text style={styles.codeHeaderText}>
-                  {(block.language || "CODE").toUpperCase()} {block.isIncomplete ? "(streaming)" : ""}
-                </Text>
-              </View>
-              <TouchableOpacity onPress={() => handleCopyToClipboard(block.value, idx)} style={styles.copyBtn}>
-                {copiedIndex === idx ? <Icons.Check /> : <Icons.Copy />}
+              <Text style={styles.codeLang}>{block.language?.toUpperCase() || "CODE"}</Text>
+              <TouchableOpacity onPress={() => handleCopy(block.value, bi)}>
+                <Text style={styles.copyText}>{copiedIndex === bi ? "Copied" : "Copy"}</Text>
               </TouchableOpacity>
             </View>
-            <ScrollView horizontal showsHorizontalScrollIndicator={false} style={styles.codeScroll}>
+            <ScrollView horizontal>
               <Text style={styles.codeText}>{block.value}</Text>
             </ScrollView>
           </View>
         );
       }
-
-      const lines = block.value.split("\n");
-      return lines.map((line: string, lineIdx: number) => {
-        const lineKey = `${blockKey}-${lineIdx}`;
-        const trimmed = line.trim();
-        if (!trimmed) return <View key={lineKey} style={{ height: 6 }} />;
-
-        if (trimmed.startsWith("### ")) {
+      return block.value.split("\n").map((line, li) => {
+        const t = line.trim();
+        if (!t) return <View key={`${key}-${li}`} style={{ height: 6 }} />;
+        if (t.startsWith("### "))
           return (
-            <View key={lineKey} style={styles.header3Container}>
-              <View style={styles.headerDot} />
-              <Text style={styles.header3Text}>{trimmed.replace("### ", "")}</Text>
-            </View>
-          );
-        }
-        if (trimmed.startsWith("## ")) {
-          return (
-            <Text key={lineKey} style={styles.header2Text}>
-              {trimmed.replace("## ", "")}
+            <Text key={`${key}-${li}`} style={styles.h3}>
+              {t.slice(4)}
             </Text>
           );
-        }
-        if (trimmed.startsWith("* ") || trimmed.startsWith("- ")) {
+        if (t.startsWith("* ") || t.startsWith("- "))
           return (
-            <View key={lineKey} style={styles.bulletRow}>
-              <Text style={styles.bulletDot}>•</Text>
-              <Text style={styles.bulletText}>{trimmed.substring(2)}</Text>
-            </View>
+            <Text key={`${key}-${li}`} style={styles.bullet}>
+              • {t.slice(2)}
+            </Text>
           );
-        }
-
         return (
-          <Text key={lineKey} style={styles.bodyText}>
+          <Text key={`${key}-${li}`} style={styles.body}>
             {line}
           </Text>
         );
@@ -360,150 +394,138 @@ export default function App() {
     });
   };
 
-  const hasAnswers = Boolean(suggestionStream) || history.length > 0;
-  const latestHistoryIndex = history.length - 1;
+  const subActive = subscription?.status === "active";
 
   return (
-    <SafeAreaView style={styles.safeArea}>
+    <SafeAreaView style={styles.safe}>
       <StatusBar barStyle="light-content" backgroundColor="#020617" />
 
-      <View style={styles.headerBar}>
-        <View style={styles.row}>
-          <View style={styles.logoBadge}>
-            <Text style={styles.logoEmoji}>✨</Text>
-          </View>
-          <View>
-            <Text style={styles.logoTitle}>The Interview Helper</Text>
-            <Text style={styles.logoSubtitle}>
-              {isPaired ? `Room ${roomCode} · ${isConnected ? "Live" : "Reconnecting…"}` : "Android Companion"}
-            </Text>
-          </View>
+      <View style={styles.header}>
+        <View>
+          <Text style={styles.headerTitle}>Interview Helper</Text>
+          <Text style={styles.headerSub}>
+            {isSessionActive ? `Room ${roomCode} · Live` : subActive ? "Ready to start" : "Subscribe to pair"}
+          </Text>
         </View>
-
-        {isPaired && (
-          <TouchableOpacity onPress={handleDisconnect} style={styles.disconnectBadge}>
-            <Text style={styles.disconnectBadgeText}>Unpair</Text>
+        {isSessionActive && (
+          <TouchableOpacity onPress={endSession} style={styles.endBtn}>
+            <Text style={styles.endBtnText}>End</Text>
           </TouchableOpacity>
         )}
       </View>
 
-      {!isPaired ? (
-        <ScrollView contentContainerStyle={styles.pairingContainer} keyboardShouldPersistTaps="handled">
-          <View style={styles.pairingCard}>
-            <Text style={styles.pairingEmoji}>📱</Text>
-            <Text style={styles.pairingTitle}>Connect Companion Device</Text>
-            <Text style={styles.pairingSubtitle}>
-              Enter the same 6-digit room code shown on your web dashboard. AI answers will stream here in real time.
-            </Text>
+      <View style={styles.tabs}>
+        <TouchableOpacity onPress={() => setActiveTab("setup")} style={[styles.tab, activeTab === "setup" && styles.tabActive]}>
+          <Text style={styles.tabText}>Setup</Text>
+        </TouchableOpacity>
+        <TouchableOpacity
+          onPress={() => setActiveTab("live")}
+          style={[styles.tab, activeTab === "live" && styles.tabActive]}
+          disabled={!isSessionActive}
+        >
+          <Text style={[styles.tabText, !isSessionActive && styles.tabDisabled]}>Live answers</Text>
+        </TouchableOpacity>
+      </View>
 
-            <View style={styles.inputGroup}>
-              <Text style={styles.inputLabel}>RELAY SERVER URL</Text>
-              <TextInput
-                value={serverUrl}
-                onChangeText={setServerUrl}
-                style={styles.inputField}
-                placeholder={DEFAULT_SERVER_URL}
-                placeholderTextColor="#475569"
-                autoCapitalize="none"
-                autoCorrect={false}
-              />
-            </View>
-
-            <View style={styles.inputGroup}>
-              <Text style={styles.inputLabel}>6-DIGIT PAIRING CODE</Text>
-              <TextInput
-                value={roomCode}
-                onChangeText={(val) => setRoomCode(val.replace(/\D/g, ""))}
-                maxLength={6}
-                keyboardType="number-pad"
-                style={styles.codeInputField}
-                placeholder="e.g. 512039"
-                placeholderTextColor="#334155"
-              />
-            </View>
-
-            {connectionError ? <Text style={styles.errorText}>{connectionError}</Text> : null}
-
-            <TouchableOpacity onPress={handleConnectAndJoin} style={styles.pairButton} disabled={isConnecting || !prefsLoaded}>
-              {isConnecting ? <ActivityIndicator color="#fff" /> : <Text style={styles.pairButtonText}>Link Session</Text>}
+      {activeTab === "setup" ? (
+        <ScrollView contentContainerStyle={styles.setupPad} keyboardShouldPersistTaps="handled">
+          <Text style={styles.sectionLabel}>BILLING EMAIL (same as payment)</Text>
+          <TextInput
+            style={styles.input}
+            value={email}
+            onChangeText={setEmail}
+            placeholder="you@email.com"
+            placeholderTextColor="#475569"
+            autoCapitalize="none"
+            keyboardType="email-address"
+          />
+          <View style={styles.row}>
+            <TouchableOpacity onPress={checkSubscription} style={styles.secondaryBtn} disabled={checkingSub}>
+              <Text style={styles.secondaryBtnText}>{checkingSub ? "…" : "Check subscription"}</Text>
+            </TouchableOpacity>
+            <TouchableOpacity onPress={syncSubscription} style={styles.secondaryBtn} disabled={checkingSub}>
+              <Text style={styles.secondaryBtnText}>Refresh from Stripe</Text>
             </TouchableOpacity>
           </View>
+          {!subActive && (
+            <TouchableOpacity onPress={openSubscribePage} style={styles.subscribeBtn}>
+              <Text style={styles.subscribeBtnText}>Subscribe — €20/month</Text>
+            </TouchableOpacity>
+          )}
+          {subActive && (
+            <Text style={styles.activeBadge}>✓ Subscription active for {subscription?.email}</Text>
+          )}
 
-          <View style={styles.specCard}>
-            <Icons.Lock />
-            <Text style={styles.specDesc}>
-              Uses the production relay by default. Generate a room code on the web app, then link this phone with the same code.
-            </Text>
+          <InterviewProfileForm
+            profile={profile}
+            onChange={setProfile}
+            liveTranscript={liveTranscript}
+            onLiveTranscriptChange={setLiveTranscript}
+          />
+
+          <View style={styles.autoRow}>
+            <Text style={styles.autoLabel}>Auto-analyze when Windows sends screenshot</Text>
+            <Switch value={autoAnalyze} onValueChange={setAutoAnalyze} trackColor={{ true: "#4f46e5" }} />
           </View>
+
+          {!isSessionActive ? (
+            <TouchableOpacity
+              onPress={startSession}
+              style={[styles.primaryBtn, (!subActive || isConnecting) && styles.primaryBtnDisabled]}
+              disabled={!subActive || isConnecting}
+            >
+              {isConnecting ? (
+                <ActivityIndicator color="#fff" />
+              ) : (
+                <Text style={styles.primaryBtnText}>Start pairing session</Text>
+              )}
+            </TouchableOpacity>
+          ) : (
+            <View style={styles.roomCard}>
+              <Text style={styles.roomLabel}>WINDOWS CLIENT ROOM CODE</Text>
+              <Text style={styles.roomCode}>{roomCode}</Text>
+              <Text style={styles.roomHint}>
+                On your Windows PC run InterviewHelperCapture.exe with this code. Press Ctrl+Shift+Space during the interview to send full-screen captures here.
+              </Text>
+            </View>
+          )}
+          {connectionError ? <Text style={styles.error}>{connectionError}</Text> : null}
         </ScrollView>
       ) : (
-        <View style={styles.activeContainer}>
-          <View style={styles.telemetryBar}>
-            <View style={[styles.telemetryCard, { marginRight: 8 }]}>
-              <Text style={styles.telemetryLabel}>SCREEN CAPTURE</Text>
-              <Text style={styles.telemetryValue} numberOfLines={1}>
-                {screenshotName ? `📷 ${screenshotName}` : screenshotText ? "📷 Screen text received" : "Awaiting screen…"}
-              </Text>
+        <View style={styles.liveWrap}>
+          {screenshotUri ? (
+            <View style={styles.shotWrap}>
+              <Text style={styles.shotLabel}>Latest capture {screenshotName ? `· ${screenshotName}` : ""}</Text>
+              <Image source={{ uri: screenshotUri }} style={styles.shotImage} resizeMode="contain" />
+              <TouchableOpacity
+                style={styles.analyzeBtn}
+                onPress={() => requestAiAssist(pendingImageRef.current, liveTranscript)}
+              >
+                <Text style={styles.analyzeBtnText}>Analyze screen with AI</Text>
+              </TouchableOpacity>
             </View>
-            <View style={styles.telemetryCard}>
-              <Text style={styles.telemetryLabel}>SPEECH INPUT</Text>
-              <Text style={styles.telemetryValue} numberOfLines={2}>
-                {speechTranscript ? `🎙️ "${speechTranscript}"` : "Awaiting interviewer voice…"}
-              </Text>
-            </View>
-          </View>
+          ) : (
+            <Text style={styles.waitShot}>Waiting for Windows screenshot (Ctrl+Shift+Space on PC)…</Text>
+          )}
 
-          <ScrollView ref={scrollViewRef} contentContainerStyle={styles.suggestionContent} style={styles.suggestionScrollView}>
-            {isAiStreaming && !suggestionStream ? (
-              <View style={styles.loaderContainer}>
-                <ActivityIndicator size="large" color="#6366f1" />
-                <Text style={styles.loaderText}>GENERATING ANSWER…</Text>
-                <Text style={styles.loaderSub}>Streaming will appear here momentarily.</Text>
+          <ScrollView ref={scrollViewRef} style={styles.answerScroll} contentContainerStyle={styles.answerPad}>
+            {isAiStreaming && !suggestionStream && (
+              <View style={styles.loading}>
+                <ActivityIndicator color="#6366f1" size="large" />
+                <Text style={styles.loadingText}>Generating personalized answer…</Text>
               </View>
-            ) : null}
-
-            {!isAiStreaming && !hasAnswers && !aiError ? (
-              <View style={styles.emptyContainer}>
-                <Icons.Sparkles />
-                <Text style={styles.emptyTitle}>Waiting for Answers</Text>
-                <Text style={styles.emptySubtitle}>
-                  Trigger AI assist from the web dashboard or Windows capture client. Answers appear here automatically.
-                </Text>
+            )}
+            {aiError ? <Text style={styles.error}>{aiError}</Text> : null}
+            {history.map((item, i) => (
+              <View key={`h-${i}`} style={styles.answerCard}>
+                <Text style={styles.answerMeta}>Answer #{i + 1} · {item.timestamp}</Text>
+                {renderMarkdown(item.content, `h${i}`)}
               </View>
-            ) : null}
-
-            {aiError ? (
-              <View style={styles.errorBanner}>
-                <Text style={styles.errorBannerTitle}>AI Error</Text>
-                <Text style={styles.errorBannerText}>{aiError}</Text>
-              </View>
-            ) : null}
-
-            {history.map((item, index) => {
-              const isLatest = index === latestHistoryIndex && !suggestionStream && !isAiStreaming;
-              return (
-                <View
-                  key={`history-${index}-${item.timestamp}`}
-                  style={[styles.historyBlock, isLatest && styles.latestHistoryBlock]}
-                >
-                  <View style={styles.historyMetaRow}>
-                    <Text style={[styles.historyMetaText, isLatest && styles.latestHistoryMetaText]}>
-                      {isLatest ? "LATEST ANSWER" : `ANSWER #${index + 1}`}
-                    </Text>
-                    <Text style={styles.historyMetaText}>{item.timestamp}</Text>
-                  </View>
-                  {renderMarkdownBlocks(item.content, `history-${index}`)}
-                </View>
-              );
-            })}
-
+            ))}
             {suggestionStream ? (
-              <View style={styles.streamingBlock}>
-                <View style={styles.activeStreamBadge}>
-                  <Icons.Sparkles />
-                  <Text style={styles.activeStreamBadgeText}>LIVE ANSWER STREAMING</Text>
-                </View>
-                {renderMarkdownBlocks(suggestionStream, "stream")}
+              <View style={styles.answerCard}>
+                <Text style={styles.answerMeta}>Streaming…</Text>
+                {renderMarkdown(suggestionStream, "stream")}
               </View>
             ) : null}
           </ScrollView>
@@ -514,405 +536,115 @@ export default function App() {
 }
 
 const styles = StyleSheet.create({
-  safeArea: {
-    flex: 1,
-    backgroundColor: "#020617",
-  },
-  row: {
+  safe: { flex: 1, backgroundColor: "#020617" },
+  header: {
     flexDirection: "row",
+    justifyContent: "space-between",
     alignItems: "center",
-  },
-  headerBar: {
-    minHeight: 60,
-    backgroundColor: "#090d16",
+    paddingHorizontal: 16,
+    paddingVertical: 12,
     borderBottomWidth: 1,
     borderColor: "#1e293b",
+  },
+  headerTitle: { color: "#fff", fontSize: 16, fontWeight: "bold" },
+  headerSub: { color: "#64748b", fontSize: 10, marginTop: 2 },
+  endBtn: { backgroundColor: "#1e293b", paddingHorizontal: 12, paddingVertical: 6, borderRadius: 6 },
+  endBtnText: { color: "#f87171", fontSize: 11, fontWeight: "bold" },
+  tabs: { flexDirection: "row", borderBottomWidth: 1, borderColor: "#1e293b" },
+  tab: { flex: 1, paddingVertical: 10, alignItems: "center" },
+  tabActive: { borderBottomWidth: 2, borderBottomColor: "#6366f1" },
+  tabText: { color: "#94a3b8", fontSize: 12, fontWeight: "600" },
+  tabDisabled: { opacity: 0.4 },
+  setupPad: { padding: 16, paddingBottom: 40 },
+  sectionLabel: { color: "#6366f1", fontSize: 9, fontWeight: "bold", letterSpacing: 1.2, marginBottom: 6 },
+  input: {
+    backgroundColor: "#0f172a",
+    borderWidth: 1,
+    borderColor: "#1e293b",
+    borderRadius: 8,
+    padding: 12,
+    color: "#f8fafc",
+    fontSize: 13,
+    marginBottom: 10,
+  },
+  row: { flexDirection: "row", gap: 8, marginBottom: 10 },
+  secondaryBtn: {
+    flex: 1,
+    backgroundColor: "#1e293b",
+    paddingVertical: 10,
+    borderRadius: 8,
+    alignItems: "center",
+  },
+  secondaryBtnText: { color: "#cbd5e1", fontSize: 11, fontWeight: "600" },
+  subscribeBtn: {
+    backgroundColor: "#4f46e5",
+    paddingVertical: 12,
+    borderRadius: 10,
+    alignItems: "center",
+    marginBottom: 16,
+  },
+  subscribeBtnText: { color: "#fff", fontWeight: "bold", fontSize: 13 },
+  activeBadge: { color: "#34d399", fontSize: 11, marginBottom: 12 },
+  autoRow: {
     flexDirection: "row",
     alignItems: "center",
     justifyContent: "space-between",
-    paddingHorizontal: 16,
-    paddingVertical: 10,
+    marginVertical: 12,
+    paddingVertical: 8,
   },
-  logoBadge: {
-    width: 32,
-    height: 32,
-    borderRadius: 8,
-    backgroundColor: "#1e1b4b",
-    alignItems: "center",
-    justifyContent: "center",
-    marginRight: 10,
-  },
-  logoEmoji: {
-    fontSize: 16,
-  },
-  logoTitle: {
-    fontFamily: Platform.OS === "ios" ? "Helvetica Neue" : "sans-serif-medium",
-    fontWeight: "bold",
-    fontSize: 14,
-    color: "#fff",
-  },
-  logoSubtitle: {
-    fontSize: 9,
-    color: "#475569",
-    marginTop: 2,
-  },
-  disconnectBadge: {
-    paddingHorizontal: 12,
-    paddingVertical: 6,
-    borderRadius: 6,
-    backgroundColor: "#1e293b",
-  },
-  disconnectBadgeText: {
-    color: "#ef4444",
-    fontSize: 11,
-    fontWeight: "bold",
-  },
-  pairingContainer: {
-    padding: 20,
-    alignItems: "center",
-    justifyContent: "center",
-    flexGrow: 1,
-  },
-  pairingCard: {
-    width: "100%",
-    maxWidth: 380,
-    backgroundColor: "#0b1329",
-    borderRadius: 16,
-    padding: 24,
-    borderWidth: 1,
-    borderColor: "#1e293b",
-    alignItems: "center",
-    shadowColor: "#6366f1",
-    shadowOffset: { width: 0, height: 8 },
-    shadowOpacity: 0.1,
-    shadowRadius: 24,
-    elevation: 8,
-  },
-  pairingEmoji: {
-    fontSize: 42,
-    marginBottom: 12,
-  },
-  pairingTitle: {
-    fontSize: 18,
-    fontWeight: "bold",
-    color: "#f8fafc",
-    marginBottom: 6,
-    textAlign: "center",
-  },
-  pairingSubtitle: {
-    fontSize: 12,
-    color: "#64748b",
-    textAlign: "center",
-    lineHeight: 18,
-    marginBottom: 24,
-  },
-  inputGroup: {
-    width: "100%",
-    marginBottom: 16,
-  },
-  inputLabel: {
-    fontSize: 9,
-    fontWeight: "bold",
-    color: "#6366f1",
-    letterSpacing: 1.5,
-    marginBottom: 6,
-  },
-  inputField: {
-    backgroundColor: "#020617",
-    borderWidth: 1,
-    borderColor: "#1e293b",
-    borderRadius: 8,
-    paddingHorizontal: 12,
-    paddingVertical: 10,
-    color: "#f8fafc",
-    fontSize: 13,
-  },
-  codeInputField: {
-    backgroundColor: "#020617",
-    borderWidth: 1,
-    borderColor: "#334155",
-    borderRadius: 8,
-    paddingHorizontal: 12,
-    paddingVertical: 12,
-    color: "#818cf8",
-    fontSize: 22,
-    fontWeight: "bold",
-    textAlign: "center",
-    letterSpacing: 4,
-  },
-  pairButton: {
-    width: "100%",
+  autoLabel: { color: "#94a3b8", fontSize: 11, flex: 1, marginRight: 8 },
+  primaryBtn: {
     backgroundColor: "#4f46e5",
-    borderRadius: 10,
     paddingVertical: 14,
-    alignItems: "center",
-    marginTop: 10,
-    shadowColor: "#4f46e5",
-    shadowOffset: { width: 0, height: 4 },
-    shadowOpacity: 0.3,
-    shadowRadius: 12,
-    elevation: 4,
-  },
-  pairButtonText: {
-    color: "#fff",
-    fontSize: 13,
-    fontWeight: "bold",
-  },
-  errorText: {
-    color: "#f87171",
-    fontSize: 11,
-    textAlign: "center",
-    marginBottom: 8,
-  },
-  specCard: {
-    marginTop: 24,
-    maxWidth: 380,
-    backgroundColor: "#090d16",
-    borderRadius: 12,
-    borderWidth: 1,
-    borderColor: "#111827",
-    padding: 16,
-    flexDirection: "row",
-    alignItems: "center",
-  },
-  specDesc: {
-    color: "#475569",
-    fontSize: 10,
-    flex: 1,
-    marginLeft: 12,
-    lineHeight: 14,
-  },
-  activeContainer: {
-    flex: 1,
-  },
-  telemetryBar: {
-    flexDirection: "row",
-    padding: 12,
-    backgroundColor: "#090d16",
-    borderBottomWidth: 1,
-    borderColor: "#1e293b",
-  },
-  telemetryCard: {
-    flex: 1,
-    backgroundColor: "#020617",
-    borderWidth: 1,
-    borderColor: "#111827",
-    borderRadius: 8,
-    padding: 8,
-  },
-  telemetryLabel: {
-    fontSize: 8,
-    fontWeight: "bold",
-    color: "#6366f1",
-    letterSpacing: 1,
-  },
-  telemetryValue: {
-    fontSize: 10,
-    color: "#94a3b8",
-    marginTop: 2,
-  },
-  suggestionScrollView: {
-    flex: 1,
-  },
-  suggestionContent: {
-    padding: 16,
-    paddingBottom: 40,
-  },
-  loaderContainer: {
-    alignItems: "center",
-    justifyContent: "center",
-    paddingVertical: 40,
-  },
-  loaderText: {
-    color: "#f8fafc",
-    fontSize: 12,
-    fontWeight: "bold",
-    letterSpacing: 1.5,
-    marginTop: 12,
-  },
-  loaderSub: {
-    color: "#475569",
-    fontSize: 10,
-    marginTop: 4,
-  },
-  emptyContainer: {
-    alignItems: "center",
-    justifyContent: "center",
-    paddingVertical: 60,
-    paddingHorizontal: 30,
-  },
-  emptyTitle: {
-    color: "#fff",
-    fontSize: 15,
-    fontWeight: "bold",
-    marginTop: 12,
-  },
-  emptySubtitle: {
-    color: "#475569",
-    fontSize: 11,
-    textAlign: "center",
-    lineHeight: 18,
-    marginTop: 6,
-  },
-  errorBanner: {
-    backgroundColor: "#450a0a",
-    borderWidth: 1,
-    borderColor: "#991b1b",
     borderRadius: 10,
-    padding: 12,
-    marginBottom: 16,
-  },
-  errorBannerTitle: {
-    color: "#fecaca",
-    fontSize: 11,
-    fontWeight: "bold",
-    marginBottom: 4,
-  },
-  errorBannerText: {
-    color: "#fca5a5",
-    fontSize: 11,
-    lineHeight: 16,
-  },
-  activeStreamBadge: {
-    flexDirection: "row",
     alignItems: "center",
-    backgroundColor: "#1e1b4b",
-    borderWidth: 1,
-    borderColor: "#312e81",
-    paddingHorizontal: 10,
-    paddingVertical: 5,
-    borderRadius: 4,
-    alignSelf: "flex-start",
-    marginBottom: 16,
-  },
-  activeStreamBadgeText: {
-    color: "#818cf8",
-    fontSize: 9,
-    fontWeight: "bold",
-    letterSpacing: 1,
-    marginLeft: 6,
-  },
-  streamingBlock: {
     marginTop: 8,
-    borderTopWidth: 1,
-    borderColor: "#312e81",
-    paddingTop: 16,
   },
-  historyBlock: {
-    borderBottomWidth: 1,
-    borderColor: "#1e293b",
-    paddingBottom: 24,
-    marginBottom: 24,
-  },
-  latestHistoryBlock: {
+  primaryBtnDisabled: { opacity: 0.5 },
+  primaryBtnText: { color: "#fff", fontWeight: "bold", fontSize: 14 },
+  roomCard: {
     backgroundColor: "#0f172a",
     borderWidth: 1,
     borderColor: "#312e81",
     borderRadius: 12,
-    padding: 12,
-    marginBottom: 16,
-  },
-  historyMetaRow: {
-    flexDirection: "row",
-    justifyContent: "space-between",
-    marginBottom: 12,
-  },
-  historyMetaText: {
-    fontSize: 9,
-    fontFamily: Platform.OS === "ios" ? "Courier" : "monospace",
-    color: "#475569",
-  },
-  latestHistoryMetaText: {
-    color: "#818cf8",
-    fontWeight: "bold",
-  },
-  codeContainer: {
-    backgroundColor: "#020617",
-    borderWidth: 1,
-    borderColor: "#1e293b",
-    borderRadius: 12,
-    overflow: "hidden",
-    marginVertical: 12,
-  },
-  codeHeader: {
-    height: 36,
-    backgroundColor: "#090d16",
-    flexDirection: "row",
+    padding: 16,
+    marginTop: 12,
     alignItems: "center",
-    justifyContent: "space-between",
-    paddingHorizontal: 12,
+  },
+  roomLabel: { color: "#818cf8", fontSize: 9, fontWeight: "bold", letterSpacing: 1.5 },
+  roomCode: { color: "#fff", fontSize: 36, fontWeight: "bold", letterSpacing: 8, marginVertical: 8 },
+  roomHint: { color: "#64748b", fontSize: 10, textAlign: "center", lineHeight: 15 },
+  error: { color: "#f87171", fontSize: 11, marginTop: 8 },
+  liveWrap: { flex: 1 },
+  shotWrap: { padding: 12, borderBottomWidth: 1, borderColor: "#1e293b" },
+  shotLabel: { color: "#6366f1", fontSize: 9, fontWeight: "bold", marginBottom: 6 },
+  shotImage: { width: "100%", height: 120, backgroundColor: "#0f172a", borderRadius: 8 },
+  analyzeBtn: {
+    marginTop: 8,
+    backgroundColor: "#312e81",
+    paddingVertical: 8,
+    borderRadius: 8,
+    alignItems: "center",
+  },
+  analyzeBtnText: { color: "#c7d2fe", fontSize: 11, fontWeight: "bold" },
+  waitShot: { color: "#64748b", fontSize: 11, textAlign: "center", padding: 16 },
+  answerScroll: { flex: 1 },
+  answerPad: { padding: 16, paddingBottom: 40 },
+  loading: { alignItems: "center", paddingVertical: 24 },
+  loadingText: { color: "#94a3b8", fontSize: 11, marginTop: 8 },
+  answerCard: {
+    marginBottom: 20,
+    paddingBottom: 16,
     borderBottomWidth: 1,
     borderColor: "#1e293b",
   },
-  codeHeaderText: {
-    color: "#94a3b8",
-    fontFamily: Platform.OS === "ios" ? "Courier" : "monospace",
-    fontSize: 10,
-    fontWeight: "bold",
-    marginLeft: 6,
-  },
-  copyBtn: {
-    padding: 4,
-  },
-  codeScroll: {
-    padding: 12,
-  },
-  codeText: {
-    color: "#cbd5e1",
-    fontFamily: Platform.OS === "ios" ? "Courier" : "monospace",
-    fontSize: 12,
-    lineHeight: 18,
-  },
-  header3Container: {
-    flexDirection: "row",
-    alignItems: "center",
-    marginTop: 18,
-    marginBottom: 8,
-    borderBottomWidth: 1,
-    borderColor: "#0f172a",
-    paddingBottom: 4,
-  },
-  headerDot: {
-    width: 6,
-    height: 14,
-    backgroundColor: "#4f46e5",
-    borderRadius: 2,
-    marginRight: 8,
-  },
-  header3Text: {
-    color: "#fff",
-    fontSize: 14,
-    fontWeight: "bold",
-  },
-  header2Text: {
-    color: "#fff",
-    fontSize: 16,
-    fontWeight: "bold",
-    marginTop: 22,
-    marginBottom: 10,
-  },
-  bulletRow: {
-    flexDirection: "row",
-    marginLeft: 8,
-    marginBottom: 6,
-    alignItems: "flex-start",
-  },
-  bulletDot: {
-    color: "#6366f1",
-    fontSize: 14,
-    marginRight: 6,
-    fontWeight: "bold",
-  },
-  bulletText: {
-    color: "#94a3b8",
-    fontSize: 12,
-    lineHeight: 18,
-    flex: 1,
-  },
-  bodyText: {
-    color: "#cbd5e1",
-    fontSize: 12,
-    lineHeight: 18,
-    marginBottom: 10,
-  },
+  answerMeta: { color: "#475569", fontSize: 9, marginBottom: 8, fontFamily: Platform.OS === "ios" ? "Courier" : "monospace" },
+  codeBox: { backgroundColor: "#0f172a", borderRadius: 8, marginVertical: 8, overflow: "hidden" },
+  codeHeader: { flexDirection: "row", justifyContent: "space-between", padding: 8, backgroundColor: "#020617" },
+  codeLang: { color: "#94a3b8", fontSize: 9, fontWeight: "bold" },
+  copyText: { color: "#818cf8", fontSize: 10 },
+  codeText: { color: "#cbd5e1", fontFamily: Platform.OS === "ios" ? "Courier" : "monospace", fontSize: 11, padding: 10 },
+  h3: { color: "#fff", fontSize: 14, fontWeight: "bold", marginTop: 10, marginBottom: 4 },
+  bullet: { color: "#94a3b8", fontSize: 12, lineHeight: 18, marginLeft: 4, marginBottom: 4 },
+  body: { color: "#cbd5e1", fontSize: 12, lineHeight: 18, marginBottom: 6 },
 });

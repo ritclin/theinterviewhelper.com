@@ -1,0 +1,2 @@
+# Build dependencies (install on Windows build machine only)
+pyinstaller>=6.3.0
