@@ -601,13 +601,19 @@ Rules: No greetings. Scannable in 5-8 seconds. Be accurate to the candidate's se
     const publicDir = path.join(process.cwd(), "public", "downloads");
     const exePath = path.join(publicDir, "InterviewHelperCapture.exe");
     const apkPath = path.join(publicDir, "interview-helper.apk");
+    const zipPath = path.join(publicDir, "interview-helper-windows.zip");
     res.json({
       success: true,
       downloads: {
         windowsZip: "/downloads/interview-helper-windows.zip",
-        windowsExe: fs.existsSync(exePath) ? "/downloads/InterviewHelperCapture.exe" : null,
-        androidApk: fs.existsSync(apkPath) ? "/downloads/interview-helper.apk" : process.env.ANDROID_APK_URL || null,
+        windowsExe: fs.existsSync(exePath) ? "/downloads/InterviewHelperCapture.exe" : "/downloads/InterviewHelperCapture.exe",
+        androidApk: fs.existsSync(apkPath) ? "/downloads/interview-helper.apk" : (process.env.ANDROID_APK_URL || "/downloads/interview-helper.apk"),
         androidPlayStore: process.env.ANDROID_PLAY_STORE_URL || null,
+        filesPresent: {
+          apk: fs.existsSync(apkPath),
+          exe: fs.existsSync(exePath),
+          zip: fs.existsSync(zipPath),
+        },
       },
     });
   });
@@ -1534,7 +1540,14 @@ function streamState(screenshotBase64: string, transcript: string) {
   // Vite development integration (local dev only — production bundle serves /dist)
   if (!isProduction) {
     console.log("Starting development mode with Vite HMR middleware...");
-    app.use("/downloads", express.static(path.join(process.cwd(), "public", "downloads")));
+    app.use("/downloads", express.static(path.join(process.cwd(), "public", "downloads"), {
+      setHeaders(res, filePath) {
+        const name = path.basename(filePath);
+        if (name.endsWith(".apk") || name.endsWith(".exe") || name.endsWith(".zip")) {
+          res.setHeader("Content-Disposition", `attachment; filename="${name}"`);
+        }
+      },
+    }));
     const vite = await createViteServer({
       server: {
         middlewareMode: true,
@@ -1551,7 +1564,14 @@ function streamState(screenshotBase64: string, transcript: string) {
       process.exit(1);
     }
     app.use(express.static(distPath));
-    app.use("/downloads", express.static(path.join(process.cwd(), "public", "downloads")));
+    app.use("/downloads", express.static(path.join(process.cwd(), "public", "downloads"), {
+      setHeaders(res, filePath) {
+        const name = path.basename(filePath);
+        if (name.endsWith(".apk") || name.endsWith(".exe") || name.endsWith(".zip")) {
+          res.setHeader("Content-Disposition", `attachment; filename="${name}"`);
+        }
+      },
+    }));
     app.get("*", (req, res, next) => {
       if (req.path.startsWith("/api/")) {
         return next();
