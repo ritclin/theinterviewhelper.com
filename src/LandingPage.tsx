@@ -245,9 +245,10 @@ export default function LandingPage() {
               "Auto-starts on login (install.ps1)",
               "Ctrl+Shift+Space → screenshot to phone",
             ]}
-            primaryLabel={downloads.windowsExe ? "Download .exe" : "Download Windows package"}
-            primaryHref={windowsUrl}
-            secondaryLabel="Build instructions inside ZIP"
+            primaryLabel={downloads.windowsExe ? "Download .exe installer" : "Download Windows package"}
+            primaryHref={downloads.windowsExe || windowsUrl}
+            secondaryLabel={downloads.windowsExe ? "Or download ZIP source package" : "Build instructions inside ZIP"}
+            secondaryHref={downloads.windowsExe ? downloads.windowsZip : undefined}
           />
           <DownloadCard
             platform="Android"
