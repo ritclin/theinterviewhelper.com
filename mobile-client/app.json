@@ -17,7 +17,8 @@
       "adaptiveIcon": {
         "backgroundColor": "#020617"
       },
-      "package": "com.theinterviewhelper.companion"
+      "package": "com.theinterviewhelper.companion",
+      "permissions": ["RECORD_AUDIO", "MODIFY_AUDIO_SETTINGS"]
     }
   }
 }

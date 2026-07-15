@@ -19,6 +19,7 @@ import AsyncStorage from "@react-native-async-storage/async-storage";
 import { useKeepAwake } from "expo-keep-awake";
 import { io, Socket } from "socket.io-client";
 import { InterviewProfileForm, InterviewProfile } from "./components/InterviewProfileForm";
+import { useVoiceListener } from "./hooks/useVoiceListener";
 
 const DEFAULT_SERVER_URL = "https://theinterviewhelpercom-production.up.railway.app";
 const STORAGE_KEYS = {
@@ -26,6 +27,8 @@ const STORAGE_KEYS = {
   email: "tih_mobile_email",
   profile: "tih_interview_profile",
   autoAnalyze: "tih_auto_analyze",
+  autoAnswerVoice: "tih_auto_answer_voice",
+  voiceListen: "tih_voice_listen",
 };
 
 const EMPTY_PROFILE: InterviewProfile = {
@@ -53,6 +56,8 @@ export default function App() {
   const [profile, setProfile] = useState<InterviewProfile>(EMPTY_PROFILE);
   const [liveTranscript, setLiveTranscript] = useState("");
   const [autoAnalyze, setAutoAnalyze] = useState(true);
+  const [autoAnswerVoice, setAutoAnswerVoice] = useState(true);
+  const [voiceListenEnabled, setVoiceListenEnabled] = useState(true);
 
   const [roomCode, setRoomCode] = useState("");
   const [isSessionActive, setIsSessionActive] = useState(false);
@@ -77,11 +82,13 @@ export default function App() {
   useEffect(() => {
     (async () => {
       try {
-        const [savedUrl, savedEmail, savedProfile, savedAuto] = await Promise.all([
+        const [savedUrl, savedEmail, savedProfile, savedAuto, savedVoice, savedListen] = await Promise.all([
           AsyncStorage.getItem(STORAGE_KEYS.server),
           AsyncStorage.getItem(STORAGE_KEYS.email),
           AsyncStorage.getItem(STORAGE_KEYS.profile),
           AsyncStorage.getItem(STORAGE_KEYS.autoAnalyze),
+          AsyncStorage.getItem(STORAGE_KEYS.autoAnswerVoice),
+          AsyncStorage.getItem(STORAGE_KEYS.voiceListen),
         ]);
         if (savedUrl?.trim()) setServerUrl(savedUrl.trim());
         if (savedEmail?.trim()) setEmail(savedEmail.trim());
@@ -90,6 +97,8 @@ export default function App() {
           setProfile({ ...EMPTY_PROFILE, ...parsed });
         }
         if (savedAuto === "0") setAutoAnalyze(false);
+        if (savedVoice === "0") setAutoAnswerVoice(false);
+        if (savedListen === "0") setVoiceListenEnabled(false);
       } finally {
         setPrefsLoaded(true);
       }
@@ -103,8 +112,10 @@ export default function App() {
       [STORAGE_KEYS.email, email.trim()],
       [STORAGE_KEYS.profile, JSON.stringify(profile)],
       [STORAGE_KEYS.autoAnalyze, autoAnalyze ? "1" : "0"],
+      [STORAGE_KEYS.autoAnswerVoice, autoAnswerVoice ? "1" : "0"],
+      [STORAGE_KEYS.voiceListen, voiceListenEnabled ? "1" : "0"],
     ]).catch(() => {});
-  }, [serverUrl, email, profile, autoAnalyze, prefsLoaded]);
+  }, [serverUrl, email, profile, autoAnalyze, autoAnswerVoice, voiceListenEnabled, prefsLoaded]);
 
   const fetchSubscription = async (targetEmail: string): Promise<SubscriptionStatus | null> => {
     try {
@@ -164,7 +175,7 @@ export default function App() {
 
   const openSubscribePage = () => {
     const base = serverUrl.replace(/\/$/, "");
-    Alert.alert("Subscribe", `Open ${base}/subscribe in your browser to pay €20/month.`);
+    Alert.alert("Subscribe", `Open ${base} in your browser and tap Subscribe (€20/month).`);
   };
 
   const teardownSocket = useCallback(() => {
@@ -196,6 +207,25 @@ export default function App() {
     },
     [profile, liveTranscript]
   );
+
+  const handleVoiceTranscript = useCallback(
+    (text: string) => {
+      setLiveTranscript(text);
+      if (autoAnswerVoice && isSessionActive) {
+        requestAiAssist(pendingImageRef.current, text);
+      }
+    },
+    [autoAnswerVoice, isSessionActive, requestAiAssist]
+  );
+
+  const { isListening } = useVoiceListener({
+    enabled: isSessionActive && voiceListenEnabled && Boolean(email.trim()),
+    email,
+    roomCode,
+    serverUrl,
+    onTranscript: handleVoiceTranscript,
+    onError: (msg) => setAiError(msg),
+  });
 
   const registerSocketListeners = useCallback(
     (socket: Socket) => {
@@ -239,12 +269,17 @@ export default function App() {
 
       socket.on("stream-feed", (payload: { image?: string; imageName?: string; imageText?: string; audioTranscript?: string }) => {
         if (payload.imageName) setScreenshotName(payload.imageName);
-        if (payload.audioTranscript) setLiveTranscript(payload.audioTranscript);
+        if (payload.audioTranscript) {
+          setLiveTranscript(payload.audioTranscript);
+          if (autoAnswerVoice && !payload.image) {
+            requestAiAssist(null, payload.audioTranscript);
+          }
+        }
         if (payload.image) {
           setScreenshotUri(payload.image);
           pendingImageRef.current = payload.image;
           if (autoAnalyze) {
-            requestAiAssist(payload.image, payload.audioTranscript);
+            requestAiAssist(payload.image, payload.audioTranscript || liveTranscript);
           }
         }
       });
@@ -286,7 +321,7 @@ export default function App() {
         endSession();
       });
     },
-    [email, autoAnalyze, requestAiAssist, teardownSocket]
+    [email, autoAnalyze, autoAnswerVoice, liveTranscript, requestAiAssist, teardownSocket]
   );
 
   const startSession = async () => {
@@ -467,6 +502,14 @@ export default function App() {
             <Text style={styles.autoLabel}>Auto-analyze when Windows sends screenshot</Text>
             <Switch value={autoAnalyze} onValueChange={setAutoAnalyze} trackColor={{ true: "#4f46e5" }} />
           </View>
+          <View style={styles.autoRow}>
+            <Text style={styles.autoLabel}>Listen to interview voice (keep phone near laptop)</Text>
+            <Switch value={voiceListenEnabled} onValueChange={setVoiceListenEnabled} trackColor={{ true: "#4f46e5" }} />
+          </View>
+          <View style={styles.autoRow}>
+            <Text style={styles.autoLabel}>Auto-answer when voice question detected</Text>
+            <Switch value={autoAnswerVoice} onValueChange={setAutoAnswerVoice} trackColor={{ true: "#4f46e5" }} />
+          </View>
 
           {!isSessionActive ? (
             <TouchableOpacity
@@ -493,6 +536,20 @@ export default function App() {
         </ScrollView>
       ) : (
         <View style={styles.liveWrap}>
+          <View style={styles.liveStatusBar}>
+            <Text style={styles.liveStatusText}>
+              {isListening ? "🎙️ Listening to interview…" : voiceListenEnabled ? "Voice listen paused" : "Voice listen off"}
+            </Text>
+            <Text style={styles.liveStatusSub}>
+              Room {roomCode} · Windows: Ctrl+Shift+Space for coding screens
+            </Text>
+          </View>
+          {liveTranscript ? (
+            <View style={styles.transcriptBar}>
+              <Text style={styles.transcriptLabel}>Heard:</Text>
+              <Text style={styles.transcriptText} numberOfLines={2}>{liveTranscript}</Text>
+            </View>
+          ) : null}
           {screenshotUri ? (
             <View style={styles.shotWrap}>
               <Text style={styles.shotLabel}>Latest capture {screenshotName ? `· ${screenshotName}` : ""}</Text>
@@ -616,6 +673,24 @@ const styles = StyleSheet.create({
   roomHint: { color: "#64748b", fontSize: 10, textAlign: "center", lineHeight: 15 },
   error: { color: "#f87171", fontSize: 11, marginTop: 8 },
   liveWrap: { flex: 1 },
+  liveStatusBar: {
+    paddingHorizontal: 16,
+    paddingVertical: 10,
+    backgroundColor: "#0f172a",
+    borderBottomWidth: 1,
+    borderColor: "#1e293b",
+  },
+  liveStatusText: { color: "#818cf8", fontSize: 11, fontWeight: "bold" },
+  liveStatusSub: { color: "#64748b", fontSize: 9, marginTop: 2 },
+  transcriptBar: {
+    paddingHorizontal: 16,
+    paddingVertical: 8,
+    backgroundColor: "#020617",
+    borderBottomWidth: 1,
+    borderColor: "#111827",
+  },
+  transcriptLabel: { color: "#6366f1", fontSize: 8, fontWeight: "bold" },
+  transcriptText: { color: "#94a3b8", fontSize: 10, marginTop: 2 },
   shotWrap: { padding: 12, borderBottomWidth: 1, borderColor: "#1e293b" },
   shotLabel: { color: "#6366f1", fontSize: 9, fontWeight: "bold", marginBottom: 6 },
   shotImage: { width: "100%", height: 120, backgroundColor: "#0f172a", borderRadius: 8 },

@@ -25,6 +25,7 @@ try:
     from PIL import Image
     import socketio
     from pynput import keyboard
+    import sounddevice as sd
 except ImportError as exc:
     print("Missing dependencies. Run: pip install -r requirements.txt")
     print(exc)
@@ -58,6 +59,7 @@ class WindowsCaptureClient:
         self.sct = mss.mss()
         self.monitor = self.sct.monitors[1]
         self.keyboard_listener: Optional[keyboard.Listener] = None
+        self.sample_rate = 16000
         self._setup_socket_events()
 
     def _setup_socket_events(self) -> None:
@@ -123,6 +125,49 @@ class WindowsCaptureClient:
             logging.exception("Screenshot failed: %s", exc)
             return None
 
+    def get_wasapi_loopback_device_index(self) -> Optional[int]:
+        try:
+            devices = sd.query_devices()
+            host_apis = sd.query_hostapis()
+            wasapi_idx = -1
+            for idx, api in enumerate(host_apis):
+                if "wasapi" in api.get("name", "").lower():
+                    wasapi_idx = idx
+                    break
+            if wasapi_idx == -1:
+                return sd.default.device[0]
+            for idx, dev in enumerate(devices):
+                if dev.get("hostapi") == wasapi_idx and dev.get("is_loopback", False):
+                    return idx
+                if dev.get("hostapi") == wasapi_idx and "loopback" in dev.get("name", "").lower():
+                    return idx
+            return sd.default.device[0]
+        except Exception as exc:
+            logging.warning("WASAPI loopback not found: %s", exc)
+            return None
+
+    def capture_audio_wav_base64(self, duration: float = 2.5) -> Optional[str]:
+        """Capture recent system audio (interviewer on Zoom/Teams) via WASAPI loopback."""
+        try:
+            import wave
+            device_idx = self.get_wasapi_loopback_device_index()
+            if device_idx is None:
+                return None
+            frames = int(duration * self.sample_rate)
+            recording = sd.rec(frames, samplerate=self.sample_rate, channels=1, device=device_idx, dtype="int16")
+            sd.wait()
+            buf = io.BytesIO()
+            with wave.open(buf, "wb") as wf:
+                wf.setnchannels(1)
+                wf.setsampwidth(2)
+                wf.setframerate(self.sample_rate)
+                wf.writeframes(recording.tobytes())
+            encoded = base64.b64encode(buf.getvalue()).decode("utf-8")
+            return encoded
+        except Exception as exc:
+            logging.warning("Audio capture skipped: %s", exc)
+            return None
+
     def send_screenshot_to_android(self) -> None:
         if not self.connected:
             logging.warning("Not connected — cannot send screenshot")
@@ -133,6 +178,7 @@ class WindowsCaptureClient:
             return
 
         timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+        audio_b64 = self.capture_audio_wav_base64()
         payload = {
             "image": image_b64,
             "imageName": f"screen-{timestamp}.jpg",
@@ -140,6 +186,9 @@ class WindowsCaptureClient:
             "source": "windows-stealth",
             "timestamp": time.time(),
         }
+        if audio_b64:
+            payload["audioBase64"] = audio_b64
+            payload["audioMimeType"] = "audio/wav"
         self.sio.emit("stream-data", payload)
         logging.info("Screenshot sent to Android via room %s", self.room_code)
 

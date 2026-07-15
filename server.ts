@@ -188,7 +188,7 @@ async function startServer() {
   function requireActiveSubscriptionForRoom(room: { ownerEmail?: string } | undefined): string | null {
     if (!room?.ownerEmail) return "Room has no active subscription owner.";
     if (!hasActiveSubscription(room.ownerEmail)) {
-      return "Active €20/month subscription required. Subscribe at /subscribe";
+      return "Active €20/month subscription required. Subscribe on the website.";
     }
     return null;
   }
@@ -576,6 +576,74 @@ Do not include greetings or long intros. Speed is everything. Keep the total len
     });
   });
 
+  app.get("/api/downloads", (_req, res) => {
+    const publicDir = path.join(process.cwd(), "public", "downloads");
+    const exePath = path.join(publicDir, "InterviewHelperCapture.exe");
+    const apkPath = path.join(publicDir, "interview-helper.apk");
+    res.json({
+      success: true,
+      downloads: {
+        windowsZip: "/downloads/interview-helper-windows.zip",
+        windowsExe: fs.existsSync(exePath) ? "/downloads/InterviewHelperCapture.exe" : null,
+        androidApk: fs.existsSync(apkPath) ? "/downloads/interview-helper.apk" : process.env.ANDROID_APK_URL || null,
+        androidPlayStore: process.env.ANDROID_PLAY_STORE_URL || null,
+      },
+    });
+  });
+
+  app.post("/api/transcribe-audio", async (req, res) => {
+    const { email, audioBase64, mimeType, roomCode } = req.body || {};
+    const targetEmail = String(email || "").toLowerCase().trim();
+    if (!targetEmail) {
+      return res.status(400).json({ success: false, error: "Email is required." });
+    }
+    if (!hasActiveSubscription(targetEmail)) {
+      return res.status(403).json({ success: false, error: "Active subscription required.", code: "SUBSCRIPTION_REQUIRED" });
+    }
+    if (!audioBase64 || typeof audioBase64 !== "string") {
+      return res.status(400).json({ success: false, error: "Audio payload required." });
+    }
+    const raw = audioBase64.includes("base64,") ? audioBase64.split("base64,")[1] : audioBase64;
+    if (estimateBase64Bytes(raw) > LIMITS.MAX_AUDIO_BYTES) {
+      return res.status(400).json({ success: false, error: "Audio exceeds size limit." });
+    }
+
+    const audioMime = typeof mimeType === "string" ? mimeType : "audio/mp4";
+    let transcript = "";
+
+    if (aiClient) {
+      try {
+        const geminiModel = process.env.GEMINI_MODEL || "gemini-2.5-flash";
+        const result = await aiClient.models.generateContent({
+          model: geminiModel,
+          contents: [
+            { inlineData: { mimeType: audioMime, data: raw } },
+            { text: "Transcribe all spoken interview questions and dialogue in this audio clip. Return only the transcript text, no commentary." },
+          ],
+        });
+        transcript = (result.text || "").trim();
+      } catch (err: any) {
+        console.error("[Transcribe] Gemini error:", err.message);
+        return res.status(500).json({ success: false, error: "Transcription failed." });
+      }
+    } else {
+      transcript = "[Simulated transcript] Explain the time complexity of your solution and walk through the algorithm.";
+    }
+
+    if (roomCode && isValidRoomCode(roomCode)) {
+      const room = rooms.get(roomCode);
+      if (room && hasActiveSubscription(room.ownerEmail)) {
+        io.to(`room-${roomCode}`).emit("stream-feed", {
+          audioTranscript: transcript,
+          source: "voice-listener",
+          timestamp: Date.now(),
+        });
+      }
+    }
+
+    res.json({ success: true, transcript });
+  });
+
   app.get("/api/stripe/status", (req, res) => {
     const email = (req.query.email as string || "").toLowerCase().trim();
     if (!email) {
@@ -948,7 +1016,7 @@ Do not include greetings or long intros. Speed is everything. Keep the total len
           if (cb) {
             cb({
               success: false,
-              error: `Active €${SUBSCRIPTION_PRICE_EUR}/month subscription required. Subscribe at /subscribe`,
+              error: `Active €${SUBSCRIPTION_PRICE_EUR}/month subscription required. Subscribe on the website.`,
               code: "SUBSCRIPTION_REQUIRED",
             });
           }
@@ -1034,16 +1102,44 @@ Do not include greetings or long intros. Speed is everything. Keep the total len
     });
 
     // 3. Real-time Stream forwarding (Screenshots, Audio Chunks, Context payload)
-    socket.on("stream-data", (payload) => {
+    socket.on("stream-data", async (payload) => {
       const roomCode = socketToRoom.get(socket.id);
       if (!roomCode) return;
+
+      const room = rooms.get(roomCode);
+      if (!room) return;
 
       if (payload?.image && estimateBase64Bytes(String(payload.image)) > LIMITS.MAX_IMAGE_BYTES) {
         socket.emit("stream-error", { error: "Image payload exceeds 5MB limit." });
         return;
       }
 
-      io.to(`room-${roomCode}`).emit("stream-feed", payload);
+      let forwardPayload = { ...payload };
+
+      if (payload?.audioBase64 && hasActiveSubscription(room.ownerEmail) && aiClient) {
+        try {
+          const raw = String(payload.audioBase64).includes("base64,")
+            ? String(payload.audioBase64).split("base64,")[1]
+            : String(payload.audioBase64);
+          if (estimateBase64Bytes(raw) <= LIMITS.MAX_AUDIO_BYTES) {
+            const geminiModel = process.env.GEMINI_MODEL || "gemini-2.5-flash";
+            const result = await aiClient.models.generateContent({
+              model: geminiModel,
+              contents: [
+                { inlineData: { mimeType: payload.audioMimeType || "audio/wav", data: raw } },
+                { text: "Transcribe spoken interview content. Return only the transcript." },
+              ],
+            });
+            const transcript = (result.text || "").trim();
+            if (transcript) forwardPayload.audioTranscript = transcript;
+          }
+        } catch (err: any) {
+          console.warn("[Stream] Audio transcribe skipped:", err.message);
+        }
+        delete forwardPayload.audioBase64;
+      }
+
+      io.to(`room-${roomCode}`).emit("stream-feed", forwardPayload);
     });
 
     socket.on("request-ai-assist", async (payload) => {
