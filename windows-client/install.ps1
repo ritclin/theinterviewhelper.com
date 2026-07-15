@@ -12,12 +12,17 @@ $ErrorActionPreference = "Stop"
 
 $installDir = Join-Path $env:LOCALAPPDATA "InterviewHelper"
 $exeName = "InterviewHelperCapture.exe"
-$sourceExe = Join-Path $PSScriptRoot "dist\$exeName"
+$sourceExe = Join-Path $PSScriptRoot $exeName
+if (-not (Test-Path $sourceExe)) {
+  $sourceExe = Join-Path $PSScriptRoot "dist\$exeName"
+}
 
 if (-not (Test-Path $sourceExe)) {
-  Write-Host "Build the exe first: powershell -File build.ps1"
+  Write-Host "InterviewHelperCapture.exe not found next to install.ps1"
   exit 1
 }
+
+Unblock-File -LiteralPath $sourceExe -ErrorAction SilentlyContinue
 
 New-Item -ItemType Directory -Force -Path $installDir | Out-Null
 Copy-Item $sourceExe (Join-Path $installDir $exeName) -Force

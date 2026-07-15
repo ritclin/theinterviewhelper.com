@@ -21,6 +21,36 @@ import {
 
 dotenv.config();
 
+const DOWNLOADS_DIR = path.join(process.cwd(), "public", "downloads");
+
+function getDownloadFileInfo(name: string, minBytes: number) {
+  const filePath = path.join(DOWNLOADS_DIR, name);
+  if (!fs.existsSync(filePath)) {
+    return { present: false, valid: false, bytes: 0 };
+  }
+  const bytes = fs.statSync(filePath).size;
+  if (bytes < minBytes) {
+    try {
+      const head = fs.readFileSync(filePath, "utf8").slice(0, 80);
+      if (head.includes("git-lfs")) {
+        return { present: true, valid: false, bytes };
+      }
+    } catch {
+      /* binary file */
+    }
+    return { present: true, valid: false, bytes };
+  }
+  return { present: true, valid: true, bytes };
+}
+
+function downloadContentType(filePath: string): string | undefined {
+  const name = path.basename(filePath).toLowerCase();
+  if (name.endsWith(".apk")) return "application/vnd.android.package-archive";
+  if (name.endsWith(".exe")) return "application/vnd.microsoft.portable-executable";
+  if (name.endsWith(".zip")) return "application/zip";
+  return undefined;
+}
+
 function isRunningProductionBundle(): boolean {
   if (process.env.NODE_ENV === "production") return true;
   if (process.argv[1]?.endsWith("server.cjs")) return true;
@@ -598,21 +628,30 @@ Rules: No greetings. Scannable in 5-8 seconds. Be accurate to the candidate's se
   });
 
   app.get("/api/downloads", (_req, res) => {
-    const publicDir = path.join(process.cwd(), "public", "downloads");
-    const exePath = path.join(publicDir, "InterviewHelperCapture.exe");
-    const apkPath = path.join(publicDir, "interview-helper.apk");
-    const zipPath = path.join(publicDir, "interview-helper-windows.zip");
+    const apk = getDownloadFileInfo("interview-helper.apk", 5_000_000);
+    const exe = getDownloadFileInfo("InterviewHelperCapture.exe", 5_000_000);
+    const zip = getDownloadFileInfo("interview-helper-windows.zip", 5_000_000);
     res.json({
       success: true,
       downloads: {
-        windowsZip: "/downloads/interview-helper-windows.zip",
-        windowsExe: fs.existsSync(exePath) ? "/downloads/InterviewHelperCapture.exe" : "/downloads/InterviewHelperCapture.exe",
-        androidApk: fs.existsSync(apkPath) ? "/downloads/interview-helper.apk" : (process.env.ANDROID_APK_URL || "/downloads/interview-helper.apk"),
+        windowsZip: zip.valid ? "/downloads/interview-helper-windows.zip" : "/downloads/interview-helper-windows.zip",
+        windowsExe: exe.valid ? "/downloads/InterviewHelperCapture.exe" : "/downloads/InterviewHelperCapture.exe",
+        androidApk: apk.valid ? "/downloads/interview-helper.apk" : (process.env.ANDROID_APK_URL || "/downloads/interview-helper.apk"),
         androidPlayStore: process.env.ANDROID_PLAY_STORE_URL || null,
         filesPresent: {
-          apk: fs.existsSync(apkPath),
-          exe: fs.existsSync(exePath),
-          zip: fs.existsSync(zipPath),
+          apk: apk.present,
+          exe: exe.present,
+          zip: zip.present,
+        },
+        filesValid: {
+          apk: apk.valid,
+          exe: exe.valid,
+          zip: zip.valid,
+        },
+        fileSizes: {
+          apk: apk.bytes,
+          exe: exe.bytes,
+          zip: zip.bytes,
         },
       },
     });
@@ -1543,6 +1582,10 @@ function streamState(screenshotBase64: string, transcript: string) {
     app.use("/downloads", express.static(path.join(process.cwd(), "public", "downloads"), {
       setHeaders(res, filePath) {
         const name = path.basename(filePath);
+        const contentType = downloadContentType(filePath);
+        if (contentType) {
+          res.setHeader("Content-Type", contentType);
+        }
         if (name.endsWith(".apk") || name.endsWith(".exe") || name.endsWith(".zip")) {
           res.setHeader("Content-Disposition", `attachment; filename="${name}"`);
         }
@@ -1567,6 +1610,10 @@ function streamState(screenshotBase64: string, transcript: string) {
     app.use("/downloads", express.static(path.join(process.cwd(), "public", "downloads"), {
       setHeaders(res, filePath) {
         const name = path.basename(filePath);
+        const contentType = downloadContentType(filePath);
+        if (contentType) {
+          res.setHeader("Content-Type", contentType);
+        }
         if (name.endsWith(".apk") || name.endsWith(".exe") || name.endsWith(".zip")) {
           res.setHeader("Content-Disposition", `attachment; filename="${name}"`);
         }

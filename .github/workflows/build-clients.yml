@@ -39,10 +39,11 @@ jobs:
         run: |
           New-Item -ItemType Directory -Force -Path public/downloads
           Copy-Item windows-client/dist/InterviewHelperCapture.exe public/downloads/InterviewHelperCapture.exe
+          Copy-Item windows-client/INSTALL.bat public/downloads/INSTALL.bat
           Copy-Item windows-client/RUN-STEALTH.bat public/downloads/RUN-STEALTH.bat
           Copy-Item windows-client/WINDOWS-DEFENDER.md public/downloads/WINDOWS-DEFENDER.md
           Copy-Item windows-client/install.ps1 public/downloads/install.ps1
-          Compress-Archive -Path public/downloads/InterviewHelperCapture.exe,public/downloads/RUN-STEALTH.bat,public/downloads/WINDOWS-DEFENDER.md,public/downloads/install.ps1 -DestinationPath public/downloads/interview-helper-windows.zip -Force
+          Compress-Archive -Path public/downloads/InterviewHelperCapture.exe,public/downloads/INSTALL.bat,public/downloads/RUN-STEALTH.bat,public/downloads/WINDOWS-DEFENDER.md,public/downloads/install.ps1 -DestinationPath public/downloads/interview-helper-windows.zip -Force
 
       - name: Upload website downloads folder
         uses: actions/upload-artifact@v4

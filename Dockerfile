@@ -2,13 +2,11 @@ FROM node:22-alpine AS build
 
 WORKDIR /app
 
-RUN apk add --no-cache git git-lfs
 COPY package.json package-lock.json ./
 RUN npm ci
 
-COPY .gitattributes ./
 COPY . .
-RUN git lfs install && git lfs pull || true
+RUN node scripts/validate-downloads.mjs
 RUN npm run build
 
 FROM node:22-alpine

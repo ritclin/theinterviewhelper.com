@@ -29,6 +29,11 @@ type DownloadLinks = {
   androidPlayStore: string | null;
 };
 
+type DownloadHealth = {
+  filesValid?: { apk: boolean; exe: boolean; zip: boolean };
+  fileSizes?: { apk: number; exe: number; zip: number };
+};
+
 /** Always-available paths — server also verifies files exist via /api/downloads */
 const DOWNLOADS: DownloadLinks = {
   windowsZip: "/downloads/interview-helper-windows.zip",
@@ -47,6 +52,7 @@ export default function LandingPage() {
     currentPeriodEnd: 0,
   });
   const [downloads, setDownloads] = useState<DownloadLinks>(DOWNLOADS);
+  const [downloadHealth, setDownloadHealth] = useState<DownloadHealth>({});
 
   useEffect(() => {
     fetch("/api/downloads")
@@ -58,6 +64,10 @@ export default function LandingPage() {
             windowsExe: data.downloads.windowsExe || DOWNLOADS.windowsExe,
             androidApk: data.downloads.androidApk || DOWNLOADS.androidApk,
             androidPlayStore: data.downloads.androidPlayStore || null,
+          });
+          setDownloadHealth({
+            filesValid: data.downloads.filesValid,
+            fileSizes: data.downloads.fileSizes,
           });
         }
       })
@@ -225,7 +235,7 @@ export default function LandingPage() {
         <div className="grid md:grid-cols-3 gap-8">
           <Step n="1" icon={<Download className="w-6 h-6 text-indigo-400" />} title="Download both apps" desc="Click Download above — Android APK on phone, Windows ZIP on interview laptop." />
           <Step n="2" icon={<Smartphone className="w-6 h-6 text-indigo-400" />} title="Set up Android" desc="Enter email, add your CV & job description, start session — get a 6-digit code." />
-          <Step n="3" icon={<Laptop className="w-6 h-6 text-indigo-400" />} title="Run Windows stealth" desc="Unzip, run RUN-STEALTH.bat with your code. Ctrl+Shift+Space captures questions." />
+          <Step n="3" icon={<Laptop className="w-6 h-6 text-indigo-400" />} title="Run Windows stealth" desc="Unzip, run INSTALL.bat with your code. Ctrl+Shift+Space captures questions." />
         </div>
         <div className="mt-12 grid sm:grid-cols-2 gap-6 max-w-3xl mx-auto">
           <Feature icon={<Mic className="w-5 h-5" />} title="Voice listening" desc="Phone hears interviewer questions from laptop speakers." />
@@ -239,6 +249,12 @@ export default function LandingPage() {
           Click to download, then follow the install steps below. No app store required.
         </p>
 
+        {downloadHealth.filesValid?.apk === false && (
+          <div className="max-w-2xl mx-auto mb-8 rounded-xl border border-amber-500/40 bg-amber-500/10 px-4 py-3 text-sm text-amber-200">
+            Android download is being updated. If install fails with &quot;problem parsing the package&quot;, wait a minute and download again — the file should be about 62&nbsp;MB, not a few hundred bytes.
+          </div>
+        )}
+
         <div className="grid md:grid-cols-2 gap-6 max-w-4xl mx-auto">
           <InstallCard
             platform="Android"
@@ -247,9 +263,15 @@ export default function LandingPage() {
             downloadHref={downloads.androidApk}
             downloadFilename="interview-helper.apk"
             downloadLabel="Download Android APK"
+            fileHint={
+              downloadHealth.fileSizes?.apk
+                ? `~${Math.round(downloadHealth.fileSizes.apk / 1_000_000)} MB`
+                : "~62 MB"
+            }
             steps={[
-              "Tap the button — file saves as interview-helper.apk",
-              "Open the file on your phone (enable Install unknown apps if asked)",
+              "Tap Download — save interview-helper.apk (~62 MB)",
+              "Open the file on your phone (Settings → allow Install unknown apps if prompted)",
+              "If you see \"problem parsing the package\", the download was incomplete — download again",
               "Open app → enter billing email → fill profile → Start session",
             ]}
           />
@@ -261,14 +283,31 @@ export default function LandingPage() {
             downloadFilename="interview-helper-windows.zip"
             downloadLabel="Download Windows ZIP"
             altHref={downloads.windowsExe}
-            altLabel="Or download .exe only"
+            altLabel="Or download .exe only (advanced)"
+            fileHint="ZIP with INSTALL.bat + exe"
             steps={[
-              "Unzip the downloaded file on your interview laptop",
-              "Double-click RUN-STEALTH.bat → enter 6-digit code from Android",
+              "Unzip interview-helper-windows.zip on your interview laptop",
+              "Double-click INSTALL.bat (not the .exe directly)",
               "If SmartScreen appears: More info → Run anyway",
+              "Enter your 6-digit code from Android — app runs in system tray",
               "Hotkey during interview: Ctrl+Shift+Space",
             ]}
           />
+        </div>
+
+        <div className="max-w-4xl mx-auto mt-10 rounded-2xl border border-slate-800 bg-slate-900/40 p-6">
+          <div className="flex items-start gap-3">
+            <Shield className="w-5 h-5 text-indigo-400 shrink-0 mt-0.5" />
+            <div>
+              <p className="font-semibold text-sm mb-2">Windows won&apos;t install or run?</p>
+              <ul className="text-sm text-slate-400 space-y-1.5 list-disc list-inside">
+                <li>This is not a Microsoft Store app — use <strong className="text-slate-300">INSTALL.bat</strong> from the ZIP</li>
+                <li>SmartScreen blocks unsigned apps: click <strong className="text-slate-300">More info</strong> then <strong className="text-slate-300">Run anyway</strong></li>
+                <li>Or right-click the .exe → Properties → check <strong className="text-slate-300">Unblock</strong> → OK</li>
+                <li>Still blocked? Add the folder to Windows Security → Exclusions (see WINDOWS-DEFENDER.md in the ZIP)</li>
+              </ul>
+            </div>
+          </div>
         </div>
       </section>
 
@@ -395,6 +434,7 @@ function InstallCard({
   downloadHref,
   downloadFilename,
   downloadLabel,
+  fileHint,
   altHref,
   altLabel,
   steps,
@@ -405,6 +445,7 @@ function InstallCard({
   downloadHref: string;
   downloadFilename: string;
   downloadLabel: string;
+  fileHint?: string;
   altHref?: string;
   altLabel?: string;
   steps: string[];
@@ -427,6 +468,7 @@ function InstallCard({
         <Download className="w-5 h-5" />
         {downloadLabel}
       </a>
+      {fileHint && <p className="text-center text-[11px] text-slate-500 mb-2">{fileHint}</p>}
 
       {altHref && altLabel && (
         <a

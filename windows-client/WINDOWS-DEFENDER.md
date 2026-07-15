@@ -4,12 +4,14 @@ PyInstaller executables are often flagged because they are **unsigned**. This is
 
 ## Quick fix (recommended)
 
-1. Download **`RUN-STEALTH.bat`** together with **`InterviewHelperCapture.exe`** (same folder).
-2. Right-click **`RUN-STEALTH.bat`** → **Run as administrator** (optional but helps).
-3. Enter your 6-digit Android pairing code.
+1. Download and unzip **`interview-helper-windows.zip`** from the website.
+2. Double-click **`INSTALL.bat`** (do not double-click the `.exe` directly).
+3. Enter your 6-digit Android pairing code when prompted.
 4. If SmartScreen appears:
    - Click **More info**
    - Click **Run anyway**
+
+You can also use **`RUN-STEALTH.bat`** directly if you already read the SmartScreen instructions.
 
 ## Manual unblock
 
