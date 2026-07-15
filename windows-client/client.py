@@ -15,6 +15,7 @@ import io
 import logging
 import os
 import sys
+import tempfile
 import threading
 import time
 from datetime import datetime
@@ -36,10 +37,31 @@ MAX_PAYLOAD_BYTES = 5 * 1024 * 1024
 LOG_FILE = os.path.join(os.environ.get("LOCALAPPDATA", "."), "InterviewHelper", "capture.log")
 
 
+def _make_file_handler() -> Optional[logging.Handler]:
+    """Best-effort file logging. Never let a logging problem crash the client.
+
+    The primary target is %LOCALAPPDATA%\\InterviewHelper\\capture.log. If that
+    directory cannot be created or opened (permissions, missing env var, etc.)
+    we fall back to the system temp dir, and finally give up on file logging
+    entirely rather than raising during startup.
+    """
+    for target in (LOG_FILE, os.path.join(tempfile.gettempdir(), "interview-helper-capture.log")):
+        try:
+            os.makedirs(os.path.dirname(target) or ".", exist_ok=True)
+            return logging.FileHandler(target, encoding="utf-8")
+        except Exception:
+            continue
+    return None
+
+
 def setup_logging(stealth: bool) -> None:
-    os.makedirs(os.path.dirname(LOG_FILE), exist_ok=True)
-    handlers: list[logging.Handler] = [logging.FileHandler(LOG_FILE, encoding="utf-8")]
-    if not stealth:
+    handlers: list[logging.Handler] = []
+    file_handler = _make_file_handler()
+    if file_handler is not None:
+        handlers.append(file_handler)
+    # Always keep a console handler when not stealth; also use it as the last
+    # resort so logging is never configured with zero handlers.
+    if not stealth or not handlers:
         handlers.append(logging.StreamHandler(sys.stdout))
     logging.basicConfig(
         level=logging.INFO,
