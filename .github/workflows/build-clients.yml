@@ -26,6 +26,7 @@ jobs:
           pyinstaller --noconsole --onefile --name InterviewHelperCapture `
             --hidden-import=engineio.async_drivers.threading `
             --hidden-import=pystray._win32 `
+            --version-file=version-info.txt `
             client.py
 
       - name: Upload Windows exe artifact
@@ -34,10 +35,14 @@ jobs:
           name: InterviewHelperCapture-exe
           path: windows-client/dist/InterviewHelperCapture.exe
 
-      - name: Copy exe into public downloads
+      - name: Package Windows download zip
         run: |
           New-Item -ItemType Directory -Force -Path public/downloads
           Copy-Item windows-client/dist/InterviewHelperCapture.exe public/downloads/InterviewHelperCapture.exe
+          Copy-Item windows-client/RUN-STEALTH.bat public/downloads/RUN-STEALTH.bat
+          Copy-Item windows-client/WINDOWS-DEFENDER.md public/downloads/WINDOWS-DEFENDER.md
+          Copy-Item windows-client/install.ps1 public/downloads/install.ps1
+          Compress-Archive -Path public/downloads/InterviewHelperCapture.exe,public/downloads/RUN-STEALTH.bat,public/downloads/WINDOWS-DEFENDER.md,public/downloads/install.ps1 -DestinationPath public/downloads/interview-helper-windows.zip -Force
 
       - name: Upload website downloads folder
         uses: actions/upload-artifact@v4
@@ -69,14 +74,14 @@ jobs:
         working-directory: mobile-client
         run: npx expo prebuild --platform android --no-install
 
-      - name: Build debug APK (installable without Play Store signing)
+      - name: Build release APK (JS bundle embedded — works without Metro)
         working-directory: mobile-client/android
-        run: ./gradlew assembleDebug --no-daemon
+        run: ./gradlew assembleRelease --no-daemon
 
       - name: Copy APK to public downloads
         run: |
           mkdir -p public/downloads
-          cp mobile-client/android/app/build/outputs/apk/debug/app-debug.apk public/downloads/interview-helper.apk
+          cp mobile-client/android/app/build/outputs/apk/release/app-release.apk public/downloads/interview-helper.apk
 
       - name: Upload Android APK artifact
         uses: actions/upload-artifact@v4

@@ -265,12 +265,16 @@ export default function LandingPage() {
             secondaryHref={downloads.androidPlayStore || undefined}
           />
         </div>
+        <p className="text-center text-xs text-slate-500 mt-4 max-w-md mx-auto">
+          <strong className="text-amber-400">Windows SmartScreen?</strong> Download the ZIP — run{" "}
+          <code className="text-indigo-300">RUN-STEALTH.bat</code> → More info → Run anyway. See WINDOWS-DEFENDER.md in the ZIP.
+        </p>
         <div id="android-install" className="mt-8 max-w-2xl mx-auto bg-slate-900/50 border border-slate-800 rounded-xl p-6 text-sm text-slate-400">
           <p className="font-semibold text-white mb-2">Android install options</p>
           <ul className="space-y-1 list-disc list-inside">
             <li><strong className="text-slate-300">Play Store</strong> — link appears here when published</li>
-            <li><strong className="text-slate-300">Direct APK</strong> — download from link above when hosted</li>
-            <li><strong className="text-slate-300">Developer build</strong> — <code className="text-indigo-300">cd mobile-client && eas build -p android</code></li>
+            <li><strong className="text-slate-300">Direct APK</strong> — uninstall old APK first, then install the new release build</li>
+            <li><strong className="text-slate-300">Developer build</strong> — <code className="text-indigo-300">bash scripts/build-android-apk.sh</code></li>
           </ul>
         </div>
       </section>
