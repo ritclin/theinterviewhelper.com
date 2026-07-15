@@ -1,0 +1,23 @@
+{
+  "expo": {
+    "name": "Interview Helper",
+    "slug": "the-interview-helper",
+    "version": "1.0.0",
+    "orientation": "portrait",
+    "userInterfaceStyle": "dark",
+    "splash": {
+      "backgroundColor": "#020617"
+    },
+    "assetBundlePatterns": ["**/*"],
+    "ios": {
+      "supportsTablet": true,
+      "bundleIdentifier": "com.theinterviewhelper.companion"
+    },
+    "android": {
+      "adaptiveIcon": {
+        "backgroundColor": "#020617"
+      },
+      "package": "com.theinterviewhelper.companion"
+    }
+  }
+}

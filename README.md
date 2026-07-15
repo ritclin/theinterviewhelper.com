@@ -79,7 +79,25 @@ After deploying the relay server, point clients at your public URL instead of `l
 
 - **Web dashboard**: uses the same origin automatically
 - **Windows client**: `python client.py --server https://your-app.example.com`
-- **Mobile client (Expo)**: set the server URL in the app UI
+- **Mobile client (Expo)**: defaults to the production relay URL; enter the 6-digit room code from the web dashboard
+
+### Android companion (view AI answers on your phone)
+
+1. Generate a room code on the web dashboard (same subscription session).
+2. On your Android device, install [Expo Go](https://play.google.com/store/apps/details?id=host.exp.exponent) from the Play Store.
+3. From the repo root:
+
+```bash
+cd mobile-client
+npm install
+npx expo start
+```
+
+4. Scan the QR code with Expo Go (Android) or press `a` in the terminal if an emulator is connected.
+5. Enter the **6-digit room code** and tap **Link Session**.
+6. Trigger AI assist from the web dashboard or Windows capture client — answers stream to the phone in real time.
+
+The app keeps the screen awake during interviews and shows live streaming answers plus previous answer history.
 
 ## Health check
 
