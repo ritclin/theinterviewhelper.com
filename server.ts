@@ -698,6 +698,9 @@ Rules: No greetings. Scannable in 5-8 seconds. Be accurate to the candidate's se
       return res.status(400).json({ success: false, error: "Email is required." });
     }
     if (!hasActiveSubscription(targetEmail)) {
+      await syncSubscriptionFromStripe(targetEmail);
+    }
+    if (!hasActiveSubscription(targetEmail)) {
       return res.status(403).json({ success: false, error: "Active subscription required.", code: "SUBSCRIPTION_REQUIRED" });
     }
     if (!audioBase64 || typeof audioBase64 !== "string") {

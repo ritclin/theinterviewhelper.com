@@ -37,10 +37,10 @@ LOG_FILE = os.path.join(os.environ.get("LOCALAPPDATA", "."), "InterviewHelper", 
 
 
 def setup_logging(stealth: bool) -> None:
+    os.makedirs(os.path.dirname(LOG_FILE), exist_ok=True)
     handlers: list[logging.Handler] = [logging.FileHandler(LOG_FILE, encoding="utf-8")]
     if not stealth:
         handlers.append(logging.StreamHandler(sys.stdout))
-    os.makedirs(os.path.dirname(LOG_FILE), exist_ok=True)
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s [%(levelname)s] %(message)s",

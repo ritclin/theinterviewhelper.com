@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
-import { Audio } from "expo-av";
+import { Audio, InterruptionModeAndroid, InterruptionModeIOS } from "expo-av";
 import * as FileSystem from "expo-file-system";
+import { Platform } from "react-native";
 
 type Options = {
   enabled: boolean;
@@ -12,6 +13,56 @@ type Options = {
   chunkSeconds?: number;
 };
 
+const RECORDING_OPTIONS: Audio.RecordingOptions = {
+  isMeteringEnabled: false,
+  android: {
+    extension: ".m4a",
+    outputFormat: Audio.AndroidOutputFormat.MPEG_4,
+    audioEncoder: Audio.AndroidAudioEncoder.AAC,
+    sampleRate: 16000,
+    numberOfChannels: 1,
+    bitRate: 64000,
+  },
+  ios: {
+    extension: ".m4a",
+    audioQuality: Audio.IOSAudioQuality.MEDIUM,
+    sampleRate: 16000,
+    numberOfChannels: 1,
+    bitRate: 64000,
+    linearPCMBitDepth: 16,
+    linearPCMIsBigEndian: false,
+    linearPCMIsFloat: false,
+  },
+  web: {},
+};
+
+async function ensureMicPermission(onError?: (message: string) => void): Promise<boolean> {
+  const existing = await Audio.getPermissionsAsync();
+  if (existing.granted) return true;
+
+  const requested = await Audio.requestPermissionsAsync();
+  if (requested.granted) return true;
+
+  onError?.(
+    requested.canAskAgain
+      ? "Microphone permission is required. Open Settings → Apps → Interview Helper → Permissions → Microphone → Allow."
+      : "Microphone permission denied. Enable it in Android Settings to listen to interview questions."
+  );
+  return false;
+}
+
+async function configureAudioSession() {
+  await Audio.setAudioModeAsync({
+    allowsRecordingIOS: true,
+    playsInSilentModeIOS: true,
+    staysActiveInBackground: true,
+    shouldDuckAndroid: true,
+    playThroughEarpieceAndroid: false,
+    interruptionModeAndroid: InterruptionModeAndroid.DoNotMix,
+    interruptionModeIOS: InterruptionModeIOS.DoNotMix,
+  });
+}
+
 export function useVoiceListener({
   enabled,
   email,
@@ -19,11 +70,12 @@ export function useVoiceListener({
   serverUrl,
   onTranscript,
   onError,
-  chunkSeconds = 7,
+  chunkSeconds = 6,
 }: Options) {
   const [isListening, setIsListening] = useState(false);
   const loopRef = useRef(false);
   const recordingRef = useRef<Audio.Recording | null>(null);
+  const failCountRef = useRef(0);
 
   const transcribeFile = useCallback(
     async (uri: string) => {
@@ -37,12 +89,13 @@ export function useVoiceListener({
         body: JSON.stringify({
           email: email.trim().toLowerCase(),
           roomCode,
-          mimeType: "audio/mp4",
+          mimeType: Platform.OS === "android" ? "audio/mp4" : "audio/m4a",
           audioBase64,
         }),
       });
       const data = await res.json();
       if (data.success && data.transcript?.trim()) {
+        failCountRef.current = 0;
         onTranscript(data.transcript.trim());
       } else if (!data.success && data.error) {
         onError?.(data.error);
@@ -52,28 +105,28 @@ export function useVoiceListener({
   );
 
   const recordLoop = useCallback(async () => {
+    if (!(await ensureMicPermission(onError))) {
+      loopRef.current = false;
+      return;
+    }
+
+    try {
+      await configureAudioSession();
+    } catch {
+      onError?.("Could not configure audio. Close other apps using the microphone and try again.");
+      loopRef.current = false;
+      return;
+    }
+
     while (loopRef.current) {
+      let recording: Audio.Recording | null = null;
       try {
-        const permission = await Audio.requestPermissionsAsync();
-        if (!permission.granted) {
-          onError?.("Microphone permission required to listen to the interview.");
-          loopRef.current = false;
-          break;
-        }
-
-        await Audio.setAudioModeAsync({
-          allowsRecordingIOS: true,
-          playsInSilentModeIOS: true,
-          staysActiveInBackground: true,
-          shouldDuckAndroid: true,
-          playThroughEarpieceAndroid: false,
-        });
-
-        const recording = new Audio.Recording();
-        await recording.prepareToRecordAsync(Audio.RecordingOptionsPresets.HIGH_QUALITY);
+        recording = new Audio.Recording();
+        await recording.prepareToRecordAsync(RECORDING_OPTIONS);
         recordingRef.current = recording;
         await recording.startAsync();
         setIsListening(true);
+        failCountRef.current = 0;
 
         await new Promise((r) => setTimeout(r, chunkSeconds * 1000));
         if (!loopRef.current) break;
@@ -91,11 +144,30 @@ export function useVoiceListener({
             // ignore
           }
         }
-      } catch {
+
+        await new Promise((r) => setTimeout(r, 400));
+      } catch (err) {
         setIsListening(false);
-        onError?.("Microphone error. Keep phone near laptop speakers.");
-        loopRef.current = false;
-        break;
+        recordingRef.current = null;
+        if (recording) {
+          try {
+            await recording.stopAndUnloadAsync();
+          } catch {
+            // ignore
+          }
+        }
+
+        failCountRef.current += 1;
+        if (failCountRef.current >= 3 || !loopRef.current) {
+          onError?.(
+            "Microphone error. Allow microphone access, keep the phone near laptop speakers, and tap Resume listening."
+          );
+          loopRef.current = false;
+          break;
+        }
+
+        await configureAudioSession();
+        await new Promise((r) => setTimeout(r, 800));
       }
     }
     setIsListening(false);
@@ -104,6 +176,7 @@ export function useVoiceListener({
   useEffect(() => {
     if (enabled && email && roomCode) {
       loopRef.current = true;
+      failCountRef.current = 0;
       recordLoop();
     } else {
       loopRef.current = false;

@@ -16,6 +16,7 @@ import {
   Switch,
 } from "react-native";
 import AsyncStorage from "@react-native-async-storage/async-storage";
+import { Audio } from "expo-av";
 import { useKeepAwake } from "expo-keep-awake";
 import { io, Socket } from "socket.io-client";
 import { InterviewProfileForm, InterviewProfile } from "./components/InterviewProfileForm";
@@ -62,6 +63,8 @@ export default function App() {
 
   const [roomCode, setRoomCode] = useState("");
   const [isSessionActive, setIsSessionActive] = useState(false);
+  const [windowsConnected, setWindowsConnected] = useState(false);
+  const [sessionPaused, setSessionPaused] = useState(false);
   const [isConnecting, setIsConnecting] = useState(false);
   const [connectionError, setConnectionError] = useState("");
 
@@ -222,6 +225,7 @@ export default function App() {
 
   const requestAiAssist = useCallback(
     (image?: string | null, transcript?: string) => {
+      if (sessionPaused) return;
       const socket = socketRef.current;
       if (!socket?.connected) return;
       if (!profile.targetPosition.trim()) {
@@ -237,21 +241,27 @@ export default function App() {
         timestamp: Date.now(),
       });
     },
-    [profile, liveTranscript]
+    [profile, liveTranscript, sessionPaused]
   );
 
   const handleVoiceTranscript = useCallback(
     (text: string) => {
       setLiveTranscript(text);
-      if (autoAnswerVoice && isSessionActive) {
+      if (autoAnswerVoice && isSessionActive && windowsConnected && !sessionPaused) {
         requestAiAssist(pendingImageRef.current, text);
       }
     },
-    [autoAnswerVoice, isSessionActive, requestAiAssist]
+    [autoAnswerVoice, isSessionActive, windowsConnected, sessionPaused, requestAiAssist]
   );
 
   const { isListening } = useVoiceListener({
-    enabled: isSessionActive && voiceListenEnabled && Boolean(email.trim()),
+    enabled:
+      isSessionActive &&
+      windowsConnected &&
+      voiceListenEnabled &&
+      !sessionPaused &&
+      Boolean(email.trim()) &&
+      Boolean(roomCode),
     email,
     roomCode,
     serverUrl,
@@ -268,7 +278,9 @@ export default function App() {
           if (response?.success) {
             setRoomCode(response.roomCode);
             setIsSessionActive(true);
-            setActiveTab("live");
+            setWindowsConnected(false);
+            setSessionPaused(false);
+            setActiveTab("setup");
             setHistory([]);
             setSuggestionStream("");
             setAiError("");
@@ -290,8 +302,20 @@ export default function App() {
 
       socket.on("disconnect", () => {
         setIsSessionActive(false);
+        setWindowsConnected(false);
         setIsConnecting(false);
         setIsAiStreaming(false);
+      });
+
+      socket.on("paired", (data: { clientsCount?: number; roomCode?: string }) => {
+        if ((data?.clientsCount || 0) >= 1) {
+          setWindowsConnected(true);
+          setSessionPaused(false);
+          setActiveTab("live");
+          setVoiceListenEnabled(true);
+          setAutoAnswerVoice(true);
+          setAiError("");
+        }
       });
 
       socket.on("connect_error", (err: Error) => {
@@ -300,6 +324,7 @@ export default function App() {
       });
 
       socket.on("stream-feed", (payload: { image?: string; imageName?: string; imageText?: string; audioTranscript?: string }) => {
+        if (sessionPaused) return;
         if (payload.imageName) setScreenshotName(payload.imageName);
         if (payload.audioTranscript) {
           setLiveTranscript(payload.audioTranscript);
@@ -353,7 +378,7 @@ export default function App() {
         endSession();
       });
     },
-    [email, autoAnalyze, autoAnswerVoice, liveTranscript, requestAiAssist, teardownSocket]
+    [email, autoAnalyze, autoAnswerVoice, liveTranscript, requestAiAssist, teardownSocket, sessionPaused]
   );
 
   const startSession = async () => {
@@ -361,6 +386,15 @@ export default function App() {
     if (!profile.targetPosition.trim()) {
       Alert.alert("Profile", "Enter the position you are interviewing for.");
       setActiveTab("setup");
+      return;
+    }
+
+    const mic = await Audio.requestPermissionsAsync();
+    if (!mic.granted) {
+      Alert.alert(
+        "Microphone required",
+        "Allow microphone access so the phone can hear interview questions from your laptop speakers."
+      );
       return;
     }
 
@@ -380,6 +414,8 @@ export default function App() {
   const endSession = () => {
     teardownSocket();
     setIsSessionActive(false);
+    setWindowsConnected(false);
+    setSessionPaused(false);
     setRoomCode("");
     setScreenshotUri(null);
     setSuggestionStream("");
@@ -469,6 +505,14 @@ export default function App() {
 
   const subActive = subscription?.status === "active";
 
+  const toggleSessionPause = () => {
+    setSessionPaused((prev) => {
+      const next = !prev;
+      if (!next) setAiError("");
+      return next;
+    });
+  };
+
   return (
     <SafeAreaView style={styles.safe}>
       <StatusBar barStyle="light-content" backgroundColor="#020617" />
@@ -477,7 +521,15 @@ export default function App() {
         <View>
           <Text style={styles.headerTitle}>Interview Helper</Text>
           <Text style={styles.headerSub}>
-            {isSessionActive ? `Room ${roomCode} · Live` : subActive ? "Ready to start" : "Subscribe to pair"}
+            {isSessionActive
+              ? windowsConnected
+                ? sessionPaused
+                  ? `Room ${roomCode} · Paused`
+                  : `Room ${roomCode} · Live`
+                : `Room ${roomCode} · Waiting for Windows`
+              : subActive
+                ? "Ready to start"
+                : "Subscribe to pair"}
           </Text>
         </View>
         {isSessionActive && (
@@ -494,9 +546,9 @@ export default function App() {
         <TouchableOpacity
           onPress={() => setActiveTab("live")}
           style={[styles.tab, activeTab === "live" && styles.tabActive]}
-          disabled={!isSessionActive}
+          disabled={!isSessionActive || !windowsConnected}
         >
-          <Text style={[styles.tabText, !isSessionActive && styles.tabDisabled]}>Live answers</Text>
+          <Text style={[styles.tabText, (!isSessionActive || !windowsConnected) && styles.tabDisabled]}>Live answers</Text>
         </TouchableOpacity>
       </View>
 
@@ -566,8 +618,15 @@ export default function App() {
               <Text style={styles.roomLabel}>WINDOWS CLIENT ROOM CODE</Text>
               <Text style={styles.roomCode}>{roomCode}</Text>
               <Text style={styles.roomHint}>
-                On your Windows PC run InterviewHelperCapture.exe with this code. Press Ctrl+Shift+Space during the interview to send full-screen captures here.
+                {windowsConnected
+                  ? "Windows is connected. Open the Live answers tab — voice listening and AI answers start automatically."
+                  : "Waiting for Windows… Run INSTALL.bat on your PC with this code. Live answers open automatically once connected."}
               </Text>
+              {windowsConnected ? (
+                <TouchableOpacity onPress={() => setActiveTab("live")} style={styles.openLiveBtn}>
+                  <Text style={styles.openLiveBtnText}>Open Live answers</Text>
+                </TouchableOpacity>
+              ) : null}
             </View>
           )}
           {connectionError ? <Text style={styles.error}>{connectionError}</Text> : null}
@@ -575,13 +634,34 @@ export default function App() {
       ) : (
         <View style={styles.liveWrap}>
           <View style={styles.liveStatusBar}>
-            <Text style={styles.liveStatusText}>
-              {isListening ? "🎙️ Listening to interview…" : voiceListenEnabled ? "Voice listen paused" : "Voice listen off"}
-            </Text>
-            <Text style={styles.liveStatusSub}>
-              Room {roomCode} · Windows: Ctrl+Shift+Space for coding screens
-            </Text>
+            <View style={{ flex: 1 }}>
+              <Text style={styles.liveStatusText}>
+                {sessionPaused
+                  ? "⏸ Paused — tap Resume to listen & answer again"
+                  : isListening
+                    ? "🎙️ Listening to interview…"
+                    : voiceListenEnabled
+                      ? "Starting microphone…"
+                      : "Voice listen off"}
+              </Text>
+              <Text style={styles.liveStatusSub}>
+                Room {roomCode} · Windows: Ctrl+Shift+Space for coding screens
+              </Text>
+            </View>
+            <TouchableOpacity
+              onPress={toggleSessionPause}
+              style={[styles.pauseBtn, sessionPaused && styles.pauseBtnActive]}
+            >
+              <Text style={styles.pauseBtnText}>{sessionPaused ? "▶ Resume" : "⏸ Pause"}</Text>
+            </TouchableOpacity>
           </View>
+          {sessionPaused ? (
+            <View style={styles.pausedBanner}>
+              <Text style={styles.pausedBannerText}>
+                AI answers and voice listening are paused. Tap Resume when the interview continues.
+              </Text>
+            </View>
+          ) : null}
           {liveTranscript ? (
             <View style={styles.transcriptBar}>
               <Text style={styles.transcriptLabel}>Heard:</Text>
@@ -709,15 +789,44 @@ const styles = StyleSheet.create({
   roomLabel: { color: "#818cf8", fontSize: 9, fontWeight: "bold", letterSpacing: 1.5 },
   roomCode: { color: "#fff", fontSize: 36, fontWeight: "bold", letterSpacing: 8, marginVertical: 8 },
   roomHint: { color: "#64748b", fontSize: 10, textAlign: "center", lineHeight: 15 },
+  openLiveBtn: {
+    marginTop: 12,
+    backgroundColor: "#4f46e5",
+    paddingHorizontal: 16,
+    paddingVertical: 10,
+    borderRadius: 8,
+  },
+  openLiveBtnText: { color: "#fff", fontWeight: "bold", fontSize: 12 },
   error: { color: "#f87171", fontSize: 11, marginTop: 8 },
   liveWrap: { flex: 1 },
   liveStatusBar: {
+    flexDirection: "row",
+    alignItems: "center",
     paddingHorizontal: 16,
     paddingVertical: 10,
     backgroundColor: "#0f172a",
     borderBottomWidth: 1,
     borderColor: "#1e293b",
+    gap: 10,
   },
+  pauseBtn: {
+    backgroundColor: "#1e293b",
+    paddingHorizontal: 14,
+    paddingVertical: 10,
+    borderRadius: 8,
+    borderWidth: 1,
+    borderColor: "#334155",
+  },
+  pauseBtnActive: { backgroundColor: "#4f46e5", borderColor: "#6366f1" },
+  pauseBtnText: { color: "#fff", fontSize: 12, fontWeight: "bold" },
+  pausedBanner: {
+    backgroundColor: "#422006",
+    borderBottomWidth: 1,
+    borderColor: "#78350f",
+    paddingHorizontal: 16,
+    paddingVertical: 8,
+  },
+  pausedBannerText: { color: "#fcd34d", fontSize: 10, lineHeight: 14 },
   liveStatusText: { color: "#818cf8", fontSize: 11, fontWeight: "bold" },
   liveStatusSub: { color: "#64748b", fontSize: 9, marginTop: 2 },
   transcriptBar: {
