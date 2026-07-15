@@ -7,7 +7,6 @@ import {
   TouchableOpacity,
   ScrollView,
   ActivityIndicator,
-  Clipboard,
   Platform,
   SafeAreaView,
   StatusBar,
@@ -15,6 +14,7 @@ import {
   Image,
   Switch,
 } from "react-native";
+import * as Clipboard from "expo-clipboard";
 import AsyncStorage from "@react-native-async-storage/async-storage";
 import { Audio } from "expo-av";
 import { useKeepAwake } from "expo-keep-awake";
@@ -50,6 +50,17 @@ export default function App() {
   const scrollViewRef = useRef<ScrollView>(null);
   const pendingImageRef = useRef<string | null>(null);
 
+  // Refs mirror mutable state so long-lived socket handlers (registered once per
+  // session) always read the latest values instead of a stale closure snapshot.
+  const roomCodeRef = useRef("");
+  const sessionPausedRef = useRef(false);
+  const autoAnalyzeRef = useRef(true);
+  const autoAnswerVoiceRef = useRef(true);
+  const profileRef = useRef<InterviewProfile>(EMPTY_PROFILE);
+  const liveTranscriptRef = useRef("");
+  const isSessionActiveRef = useRef(false);
+  const windowsConnectedRef = useRef(false);
+
   const [serverUrl, setServerUrl] = useState(DEFAULT_SERVER_URL);
   const [email, setEmail] = useState("");
   const [subscription, setSubscription] = useState<SubscriptionStatus | null>(null);
@@ -66,6 +77,7 @@ export default function App() {
   const [windowsConnected, setWindowsConnected] = useState(false);
   const [sessionPaused, setSessionPaused] = useState(false);
   const [isConnecting, setIsConnecting] = useState(false);
+  const [reconnecting, setReconnecting] = useState(false);
   const [connectionError, setConnectionError] = useState("");
 
   const [activeTab, setActiveTab] = useState<"setup" | "live">("setup");
@@ -78,6 +90,14 @@ export default function App() {
   const [history, setHistory] = useState<HistoryItem[]>([]);
   const [copiedIndex, setCopiedIndex] = useState<number | null>(null);
   const [prefsLoaded, setPrefsLoaded] = useState(false);
+
+  useEffect(() => { sessionPausedRef.current = sessionPaused; }, [sessionPaused]);
+  useEffect(() => { autoAnalyzeRef.current = autoAnalyze; }, [autoAnalyze]);
+  useEffect(() => { autoAnswerVoiceRef.current = autoAnswerVoice; }, [autoAnswerVoice]);
+  useEffect(() => { profileRef.current = profile; }, [profile]);
+  useEffect(() => { liveTranscriptRef.current = liveTranscript; }, [liveTranscript]);
+  useEffect(() => { isSessionActiveRef.current = isSessionActive; }, [isSessionActive]);
+  useEffect(() => { windowsConnectedRef.current = windowsConnected; }, [windowsConnected]);
 
   const scrollToLatest = useCallback(() => {
     requestAnimationFrame(() => scrollViewRef.current?.scrollToEnd({ animated: true }));
@@ -223,35 +243,33 @@ export default function App() {
 
   useEffect(() => () => teardownSocket(), [teardownSocket]);
 
-  const requestAiAssist = useCallback(
-    (image?: string | null, transcript?: string) => {
-      if (sessionPaused) return;
-      const socket = socketRef.current;
-      if (!socket?.connected) return;
-      if (!profile.targetPosition.trim()) {
-        Alert.alert("Profile required", "Set your target position before requesting AI answers.");
-        setActiveTab("setup");
-        return;
-      }
-      socket.emit("request-ai-assist", {
-        image: image || undefined,
-        audioTranscript: transcript || liveTranscript || undefined,
-        interviewProfile: profile,
-        prompt: "Provide a STAR-format interview answer tailored to this candidate. For coding questions include strategy and code.",
-        timestamp: Date.now(),
-      });
-    },
-    [profile, liveTranscript, sessionPaused]
-  );
+  const requestAiAssist = useCallback((image?: string | null, transcript?: string) => {
+    if (sessionPausedRef.current) return;
+    const socket = socketRef.current;
+    if (!socket?.connected) return;
+    const currentProfile = profileRef.current;
+    if (!currentProfile.targetPosition.trim()) {
+      Alert.alert("Profile required", "Set your target position before requesting AI answers.");
+      setActiveTab("setup");
+      return;
+    }
+    socket.emit("request-ai-assist", {
+      image: image || undefined,
+      audioTranscript: transcript || liveTranscriptRef.current || undefined,
+      interviewProfile: currentProfile,
+      prompt: "Provide a STAR-format interview answer tailored to this candidate. For coding questions include strategy and code.",
+      timestamp: Date.now(),
+    });
+  }, []);
 
   const handleVoiceTranscript = useCallback(
     (text: string) => {
       setLiveTranscript(text);
-      if (autoAnswerVoice && isSessionActive && windowsConnected && !sessionPaused) {
+      if (autoAnswerVoiceRef.current && isSessionActiveRef.current && windowsConnectedRef.current && !sessionPausedRef.current) {
         requestAiAssist(pendingImageRef.current, text);
       }
     },
-    [autoAnswerVoice, isSessionActive, windowsConnected, sessionPaused, requestAiAssist]
+    [requestAiAssist]
   );
 
   const { isListening } = useVoiceListener({
@@ -271,40 +289,69 @@ export default function App() {
 
   const registerSocketListeners = useCallback(
     (socket: Socket) => {
+      const emailNorm = email.trim().toLowerCase();
+
+      const handleCreateResponse = (response: any) => {
+        setIsConnecting(false);
+        if (response?.success) {
+          roomCodeRef.current = response.roomCode;
+          setRoomCode(response.roomCode);
+          setIsSessionActive(true);
+          setWindowsConnected(false);
+          setSessionPaused(false);
+          setActiveTab("setup");
+          setHistory([]);
+          setSuggestionStream("");
+          setAiError("");
+        } else {
+          const msg = response?.error || "Could not start session.";
+          setConnectionError(msg);
+          if (response?.code === "SUBSCRIPTION_REQUIRED") {
+            Alert.alert("Subscription required", msg, [
+              { text: "Refresh", onPress: syncSubscription },
+              { text: "OK" },
+            ]);
+          } else {
+            Alert.alert("Session failed", msg);
+          }
+          teardownSocket();
+        }
+      };
+
       socket.on("connect", () => {
         setConnectionError("");
-        socket.emit("create-room", { email: email.trim().toLowerCase() }, (response: any) => {
-          setIsConnecting(false);
-          if (response?.success) {
-            setRoomCode(response.roomCode);
-            setIsSessionActive(true);
-            setWindowsConnected(false);
-            setSessionPaused(false);
-            setActiveTab("setup");
-            setHistory([]);
-            setSuggestionStream("");
-            setAiError("");
-          } else {
-            const msg = response?.error || "Could not start session.";
-            setConnectionError(msg);
-            if (response?.code === "SUBSCRIPTION_REQUIRED") {
-              Alert.alert("Subscription required", msg, [
-                { text: "Refresh", onPress: syncSubscription },
-                { text: "OK" },
-              ]);
+        setReconnecting(false);
+        // On a RECONNECT, reclaim the same room code instead of minting a new one
+        // (a new code would silently orphan the already-paired Windows client).
+        if (roomCodeRef.current) {
+          socket.emit("resume-room", { email: emailNorm, roomCode: roomCodeRef.current }, (response: any) => {
+            setIsConnecting(false);
+            if (response?.success) {
+              setIsSessionActive(true);
+              if (Array.isArray(response.history)) setHistory(response.history);
+              if ((response.clientsCount || 0) >= 1) setWindowsConnected(true);
             } else {
-              Alert.alert("Session failed", msg);
+              // Room expired during the drop — fall back to a fresh session.
+              roomCodeRef.current = "";
+              socket.emit("create-room", { email: emailNorm }, handleCreateResponse);
             }
-            teardownSocket();
-          }
-        });
+          });
+        } else {
+          socket.emit("create-room", { email: emailNorm }, handleCreateResponse);
+        }
       });
 
       socket.on("disconnect", () => {
-        setIsSessionActive(false);
-        setWindowsConnected(false);
         setIsConnecting(false);
         setIsAiStreaming(false);
+        // Keep the session alive across transient drops so the connect handler
+        // can resume the same room. Only tear down if there is no active room.
+        if (roomCodeRef.current) {
+          setReconnecting(true);
+        } else {
+          setIsSessionActive(false);
+          setWindowsConnected(false);
+        }
       });
 
       socket.on("paired", (data: { clientsCount?: number; roomCode?: string }) => {
@@ -324,21 +371,27 @@ export default function App() {
       });
 
       socket.on("stream-feed", (payload: { image?: string; imageName?: string; imageText?: string; audioTranscript?: string }) => {
-        if (sessionPaused) return;
+        if (sessionPausedRef.current) return;
         if (payload.imageName) setScreenshotName(payload.imageName);
         if (payload.audioTranscript) {
           setLiveTranscript(payload.audioTranscript);
-          if (autoAnswerVoice && !payload.image) {
+          if (autoAnswerVoiceRef.current && !payload.image) {
             requestAiAssist(null, payload.audioTranscript);
           }
         }
         if (payload.image) {
           setScreenshotUri(payload.image);
           pendingImageRef.current = payload.image;
-          if (autoAnalyze) {
-            requestAiAssist(payload.image, payload.audioTranscript || liveTranscript);
+          if (autoAnalyzeRef.current) {
+            requestAiAssist(payload.image, payload.audioTranscript || liveTranscriptRef.current);
           }
         }
+      });
+
+      // Host (this device) briefly lost connection server-side; keep the session
+      // and show a reconnecting hint. The room is held during the grace window.
+      socket.on("host-disconnected", () => {
+        setReconnecting(true);
       });
 
       socket.on("ai-start", () => {
@@ -378,7 +431,7 @@ export default function App() {
         endSession();
       });
     },
-    [email, autoAnalyze, autoAnswerVoice, liveTranscript, requestAiAssist, teardownSocket, sessionPaused]
+    [email, requestAiAssist, teardownSocket]
   );
 
   const startSession = async () => {
@@ -399,6 +452,8 @@ export default function App() {
     }
 
     teardownSocket();
+    roomCodeRef.current = "";
+    setReconnecting(false);
     setIsConnecting(true);
     setConnectionError("");
 
@@ -413,6 +468,8 @@ export default function App() {
 
   const endSession = () => {
     teardownSocket();
+    roomCodeRef.current = "";
+    setReconnecting(false);
     setIsSessionActive(false);
     setWindowsConnected(false);
     setSessionPaused(false);
@@ -428,7 +485,7 @@ export default function App() {
   }, [suggestionStream, history, scrollToLatest]);
 
   const handleCopy = (text: string, index: number) => {
-    Clipboard.setString(text);
+    Clipboard.setStringAsync(text).catch(() => {});
     setCopiedIndex(index);
     setTimeout(() => setCopiedIndex(null), 2000);
   };
@@ -522,11 +579,13 @@ export default function App() {
           <Text style={styles.headerTitle}>Interview Helper</Text>
           <Text style={styles.headerSub}>
             {isSessionActive
-              ? windowsConnected
-                ? sessionPaused
-                  ? `Room ${roomCode} · Paused`
-                  : `Room ${roomCode} · Live`
-                : `Room ${roomCode} · Waiting for Windows`
+              ? reconnecting
+                ? `Room ${roomCode} · Reconnecting…`
+                : windowsConnected
+                  ? sessionPaused
+                    ? `Room ${roomCode} · Paused`
+                    : `Room ${roomCode} · Live`
+                  : `Room ${roomCode} · Waiting for Windows`
               : subActive
                 ? "Ready to start"
                 : "Subscribe to pair"}
