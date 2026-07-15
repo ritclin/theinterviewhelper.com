@@ -2,6 +2,9 @@ node_modules/
 build/
 dist/
 coverage/
+data/
+mobile-client/android/
+mobile-client/.expo/
 .DS_Store
 *.log
 .env*

@@ -22,6 +22,7 @@ export interface InterviewProfile {
   company: string;
   jobDescription: string;
   userCv: string;
+  specialInstructions: string;
 }
 
 export interface InterviewScenario {

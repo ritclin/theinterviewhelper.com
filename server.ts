@@ -98,6 +98,7 @@ async function startServer() {
     hostSocketId: string;
     clientSocketIds: string[];
     created: number;
+    ownerEmail: string;
     history: Array<{ role: string; content: string; timestamp: string }>;
     scenario?: { title: string; company: string; role: string; };
     profile?: {
@@ -105,6 +106,7 @@ async function startServer() {
       company: string;
       jobDescription: string;
       userCv: string;
+      specialInstructions: string;
     };
     aiInProgress?: boolean;
   }>();
@@ -127,13 +129,72 @@ async function startServer() {
     return stripeClient;
   }
 
-  // In-memory subscription ledger: email -> subscription info
+  // Subscription ledger: email -> subscription info (persisted to disk)
   const subscriptions = new Map<string, {
     status: "active" | "canceled" | "none";
     email: string;
     currentPeriodEnd: number;
     subscriptionId?: string;
   }>();
+
+  const SUBSCRIPTIONS_FILE = path.join(process.cwd(), "data", "subscriptions.json");
+  const SUBSCRIPTION_PRICE_EUR = 20;
+
+  function loadSubscriptionsFromDisk() {
+    try {
+      if (fs.existsSync(SUBSCRIPTIONS_FILE)) {
+        const raw = JSON.parse(fs.readFileSync(SUBSCRIPTIONS_FILE, "utf-8")) as Record<string, {
+          status: "active" | "canceled" | "none";
+          email: string;
+          currentPeriodEnd: number;
+          subscriptionId?: string;
+        }>;
+        for (const [email, sub] of Object.entries(raw)) {
+          subscriptions.set(email.toLowerCase().trim(), sub);
+        }
+        console.log(`[Billing] Loaded ${subscriptions.size} subscription record(s) from disk.`);
+      }
+    } catch (err) {
+      console.warn("[Billing] Could not load subscriptions file:", err);
+    }
+  }
+
+  function persistSubscriptionsToDisk() {
+    try {
+      const dir = path.dirname(SUBSCRIPTIONS_FILE);
+      if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+      const payload: Record<string, unknown> = {};
+      subscriptions.forEach((value, key) => {
+        payload[key] = value;
+      });
+      fs.writeFileSync(SUBSCRIPTIONS_FILE, JSON.stringify(payload, null, 2));
+    } catch (err) {
+      console.warn("[Billing] Could not persist subscriptions:", err);
+    }
+  }
+
+  function hasActiveSubscription(email: string): boolean {
+    const normalized = email.toLowerCase().trim();
+    if (!normalized) return false;
+    const sub = subscriptions.get(normalized);
+    if (!sub || sub.status !== "active") return false;
+    if (sub.currentPeriodEnd <= Date.now()) {
+      subscriptions.set(normalized, { ...sub, status: "none", currentPeriodEnd: Date.now() });
+      persistSubscriptionsToDisk();
+      return false;
+    }
+    return true;
+  }
+
+  function requireActiveSubscriptionForRoom(room: { ownerEmail?: string } | undefined): string | null {
+    if (!room?.ownerEmail) return "Room has no active subscription owner.";
+    if (!hasActiveSubscription(room.ownerEmail)) {
+      return "Active €20/month subscription required. Subscribe on the website.";
+    }
+    return null;
+  }
+
+  loadSubscriptionsFromDisk();
 
   function activateSubscription(email: string, subscriptionId?: string) {
     const normalized = email.toLowerCase().trim();
@@ -145,6 +206,7 @@ async function startServer() {
       subscriptionId: subscriptionId || "sub_" + Math.random().toString(36).substring(2, 10),
     };
     subscriptions.set(normalized, sub);
+    persistSubscriptionsToDisk();
     console.log(`[Billing] Subscription activated for: ${normalized}`);
     return sub;
   }
@@ -364,17 +426,34 @@ LIMIT 50;
     company?: string;
     jobDescription?: string;
     userCv?: string;
+    specialInstructions?: string;
   }): string {
     let instruction = `You are "The Interview Helper", an elite real-time interview coach.
 Your job is to help the candidate succeed in a live interview by analyzing the interviewer's questions, screen content, and the candidate's background.
-Deliver an ultra-optimized, condensed cheat-sheet in standard Markdown that the candidate can scan in 3-5 seconds.
-Always structure your output with these specific, scan-friendly sections:
-- **🎯 IDENTIFIED CHALLENGE**: Name the question, topic, or task being discussed.
-- **💡 OPTIMAL STRATEGY**: 2-3 bullet points with the best approach, complexity, data structures, or frameworks to mention.
-- **💻 GOLDEN CODE**: A minimal, clean code snippet when relevant (match the language in the question or job description).
-- **🗣️ TALKING POINTS**: 2 bullet points the candidate can say aloud — tie answers to their CV experience when relevant.
 
-Do not include greetings or long intros. Speed is everything. Keep the total length short and scannable.`;
+ANSWER FORMAT — always use this structure in Markdown:
+
+### 🎯 IDENTIFIED QUESTION
+One line naming the question or task.
+
+### ⭐ STAR RESPONSE
+For behavioral, situational, and experience questions, answer using STAR with bullets tied to the candidate's CV:
+- **Situation**: Brief context from a relevant role/project (prefer CV examples).
+- **Task**: What you were responsible for.
+- **Action**: Specific steps you took (use "I" statements the candidate can speak aloud).
+- **Result**: Quantified outcome or impact when possible.
+
+For technical/coding/screen questions, still include STAR when explaining approach, plus:
+### 💡 TECHNICAL STRATEGY
+2-3 bullets: approach, complexity, data structures, or architecture.
+
+### 💻 GOLDEN CODE (when relevant)
+Minimal clean code matching the question language.
+
+### 🗣️ SAY THIS ALOUD
+2 short bullet lines the candidate can read verbatim in the interview.
+
+Rules: No greetings. Scannable in 5-8 seconds. Be accurate to the candidate's seniority and the job description.`;
 
     if (profile?.targetPosition?.trim()) {
       instruction += `\n\n--- CANDIDATE TARGET ROLE ---\nPosition: ${profile.targetPosition.trim()}`;
@@ -387,7 +466,10 @@ Do not include greetings or long intros. Speed is everything. Keep the total len
       if (profile.userCv?.trim()) {
         instruction += `\n\n--- CANDIDATE CV / RESUME ---\n${profile.userCv.trim().slice(0, LIMITS.MAX_CV_CHARS)}`;
       }
-      instruction += `\n\nTailor every answer to this role and job requirements. Prefer examples from the candidate's CV in talking points. Match seniority and tech stack from the job description.`;
+      if (profile.specialInstructions?.trim()) {
+        instruction += `\n\n--- SPECIAL INSTRUCTIONS ---\n${profile.specialInstructions.trim().slice(0, LIMITS.MAX_SPECIAL_INSTRUCTIONS_CHARS)}`;
+      }
+      instruction += `\n\nTailor every STAR example to this role. Pull Situation/Action/Result from the CV when possible. Match seniority and tech stack from the job description.`;
     }
 
     return instruction;
@@ -449,6 +531,7 @@ Do not include greetings or long intros. Speed is everything. Keep the total len
               status: "none",
               currentPeriodEnd: Date.now()
             });
+            persistSubscriptionsToDisk();
           }
           console.log(`[Stripe Webhook Engine] Subscription deleted for: ${email}`);
         }
@@ -467,6 +550,7 @@ Do not include greetings or long intros. Speed is everything. Keep the total len
                 ...sub,
                 status: dataObject.status === "active" ? "active" : "canceled"
               });
+              persistSubscriptionsToDisk();
             }
           }
         }
@@ -500,6 +584,93 @@ Do not include greetings or long intros. Speed is everything. Keep the total len
   app.use(express.urlencoded({ limit: LIMITS.JSON_BODY, extended: true }));
 
   // Stripe Helper Endpoints
+  app.get("/api/stripe/plan", (_req, res) => {
+    res.json({
+      success: true,
+      plan: {
+        name: "Platinum Access",
+        priceEur: SUBSCRIPTION_PRICE_EUR,
+        currency: "eur",
+        interval: "month",
+        description: "Real-time interview assistance with screen capture pairing and personalized AI answers.",
+      },
+    });
+  });
+
+  app.get("/api/downloads", (_req, res) => {
+    const publicDir = path.join(process.cwd(), "public", "downloads");
+    const exePath = path.join(publicDir, "InterviewHelperCapture.exe");
+    const apkPath = path.join(publicDir, "interview-helper.apk");
+    const zipPath = path.join(publicDir, "interview-helper-windows.zip");
+    res.json({
+      success: true,
+      downloads: {
+        windowsZip: "/downloads/interview-helper-windows.zip",
+        windowsExe: fs.existsSync(exePath) ? "/downloads/InterviewHelperCapture.exe" : "/downloads/InterviewHelperCapture.exe",
+        androidApk: fs.existsSync(apkPath) ? "/downloads/interview-helper.apk" : (process.env.ANDROID_APK_URL || "/downloads/interview-helper.apk"),
+        androidPlayStore: process.env.ANDROID_PLAY_STORE_URL || null,
+        filesPresent: {
+          apk: fs.existsSync(apkPath),
+          exe: fs.existsSync(exePath),
+          zip: fs.existsSync(zipPath),
+        },
+      },
+    });
+  });
+
+  app.post("/api/transcribe-audio", async (req, res) => {
+    const { email, audioBase64, mimeType, roomCode } = req.body || {};
+    const targetEmail = String(email || "").toLowerCase().trim();
+    if (!targetEmail) {
+      return res.status(400).json({ success: false, error: "Email is required." });
+    }
+    if (!hasActiveSubscription(targetEmail)) {
+      return res.status(403).json({ success: false, error: "Active subscription required.", code: "SUBSCRIPTION_REQUIRED" });
+    }
+    if (!audioBase64 || typeof audioBase64 !== "string") {
+      return res.status(400).json({ success: false, error: "Audio payload required." });
+    }
+    const raw = audioBase64.includes("base64,") ? audioBase64.split("base64,")[1] : audioBase64;
+    if (estimateBase64Bytes(raw) > LIMITS.MAX_AUDIO_BYTES) {
+      return res.status(400).json({ success: false, error: "Audio exceeds size limit." });
+    }
+
+    const audioMime = typeof mimeType === "string" ? mimeType : "audio/mp4";
+    let transcript = "";
+
+    if (aiClient) {
+      try {
+        const geminiModel = process.env.GEMINI_MODEL || "gemini-2.5-flash";
+        const result = await aiClient.models.generateContent({
+          model: geminiModel,
+          contents: [
+            { inlineData: { mimeType: audioMime, data: raw } },
+            { text: "Transcribe all spoken interview questions and dialogue in this audio clip. Return only the transcript text, no commentary." },
+          ],
+        });
+        transcript = (result.text || "").trim();
+      } catch (err: any) {
+        console.error("[Transcribe] Gemini error:", err.message);
+        return res.status(500).json({ success: false, error: "Transcription failed." });
+      }
+    } else {
+      transcript = "[Simulated transcript] Explain the time complexity of your solution and walk through the algorithm.";
+    }
+
+    if (roomCode && isValidRoomCode(roomCode)) {
+      const room = rooms.get(roomCode);
+      if (room && hasActiveSubscription(room.ownerEmail)) {
+        io.to(`room-${roomCode}`).emit("stream-feed", {
+          audioTranscript: transcript,
+          source: "voice-listener",
+          timestamp: Date.now(),
+        });
+      }
+    }
+
+    res.json({ success: true, transcript });
+  });
+
   app.get("/api/stripe/status", (req, res) => {
     const email = (req.query.email as string || "").toLowerCase().trim();
     if (!email) {
@@ -736,6 +907,7 @@ Do not include greetings or long intros. Speed is everything. Keep the total len
           currentPeriodEnd: Date.now()
         });
       }
+      persistSubscriptionsToDisk();
     }
     
     webhookLogs.unshift({
@@ -851,21 +1023,46 @@ Do not include greetings or long intros. Speed is everything. Keep the total len
       socket.emit("heartbeat-ack", { time: Date.now() });
     });
 
-    // 1. Create Room (Host / Windows Client / Desktop Simulator)
-    socket.on("create-room", (callback) => {
+    // 1. Create Room (Host — Android app or web dashboard; requires active subscription)
+    socket.on("create-room", (payload, callback) => {
       try {
+        let email = "";
+        let cb: ((response: unknown) => void) | undefined = callback;
+        if (typeof payload === "function") {
+          cb = payload as (response: unknown) => void;
+        } else if (payload && typeof payload === "object") {
+          email = String((payload as { email?: string }).email || "").toLowerCase().trim();
+          cb = callback;
+        }
+
+        if (!email) {
+          if (cb) cb({ success: false, error: "Billing email is required to start pairing." });
+          return;
+        }
+        if (!hasActiveSubscription(email)) {
+          if (cb) {
+            cb({
+              success: false,
+              error: `Active €${SUBSCRIPTION_PRICE_EUR}/month subscription required. Subscribe on the website.`,
+              code: "SUBSCRIPTION_REQUIRED",
+            });
+          }
+          return;
+        }
+
         const code = generateRoomCode();
         rooms.set(code, {
           hostSocketId: socket.id,
           clientSocketIds: [],
           created: Date.now(),
-          history: []
+          ownerEmail: email,
+          history: [],
         });
         socketToRoom.set(socket.id, code);
         socket.join(`room-${code}`);
 
-        console.log(`Room created: ${code} by host ${socket.id}`);
-        if (callback) callback({ success: true, roomCode: code });
+        console.log(`Room created: ${code} by host ${socket.id} (${email})`);
+        if (cb) cb({ success: true, roomCode: code, ownerEmail: email });
       } catch (err: any) {
         console.error("Error creating room:", err);
         if (callback) callback({ success: false, error: err.message });
@@ -889,6 +1086,18 @@ Do not include greetings or long intros. Speed is everything. Keep the total len
         const room = rooms.get(roomCode);
         if (!room) {
           if (callback) callback({ success: false, error: "Room not found or invalid 6-digit code" });
+          return;
+        }
+
+        const subscriptionError = requireActiveSubscriptionForRoom(room);
+        if (subscriptionError) {
+          if (callback) {
+            callback({
+              success: false,
+              error: subscriptionError,
+              code: "SUBSCRIPTION_REQUIRED",
+            });
+          }
           return;
         }
 
@@ -920,22 +1129,57 @@ Do not include greetings or long intros. Speed is everything. Keep the total len
     });
 
     // 3. Real-time Stream forwarding (Screenshots, Audio Chunks, Context payload)
-    socket.on("stream-data", (payload) => {
+    socket.on("stream-data", async (payload) => {
       const roomCode = socketToRoom.get(socket.id);
       if (!roomCode) return;
+
+      const room = rooms.get(roomCode);
+      if (!room) return;
 
       if (payload?.image && estimateBase64Bytes(String(payload.image)) > LIMITS.MAX_IMAGE_BYTES) {
         socket.emit("stream-error", { error: "Image payload exceeds 5MB limit." });
         return;
       }
 
-      socket.to(`room-${roomCode}`).emit("stream-feed", payload);
+      let forwardPayload = { ...payload };
+
+      if (payload?.audioBase64 && hasActiveSubscription(room.ownerEmail) && aiClient) {
+        try {
+          const raw = String(payload.audioBase64).includes("base64,")
+            ? String(payload.audioBase64).split("base64,")[1]
+            : String(payload.audioBase64);
+          if (estimateBase64Bytes(raw) <= LIMITS.MAX_AUDIO_BYTES) {
+            const geminiModel = process.env.GEMINI_MODEL || "gemini-2.5-flash";
+            const result = await aiClient.models.generateContent({
+              model: geminiModel,
+              contents: [
+                { inlineData: { mimeType: payload.audioMimeType || "audio/wav", data: raw } },
+                { text: "Transcribe spoken interview content. Return only the transcript." },
+              ],
+            });
+            const transcript = (result.text || "").trim();
+            if (transcript) forwardPayload.audioTranscript = transcript;
+          }
+        } catch (err: any) {
+          console.warn("[Stream] Audio transcribe skipped:", err.message);
+        }
+        delete forwardPayload.audioBase64;
+      }
+
+      io.to(`room-${roomCode}`).emit("stream-feed", forwardPayload);
     });
 
     socket.on("request-ai-assist", async (payload) => {
       const roomCode = socketToRoom.get(socket.id);
       if (!roomCode) {
         socket.emit("ai-error", { error: "No active room association found." });
+        return;
+      }
+
+      const roomForSub = rooms.get(roomCode);
+      const subscriptionError = requireActiveSubscriptionForRoom(roomForSub);
+      if (subscriptionError) {
+        socket.emit("ai-error", { error: subscriptionError, code: "SUBSCRIPTION_REQUIRED" });
         return;
       }
 
@@ -976,6 +1220,7 @@ Do not include greetings or long intros. Speed is everything. Keep the total len
           company: String(interviewProfile.company || "").slice(0, 100),
           jobDescription: String(interviewProfile.jobDescription || "").slice(0, LIMITS.MAX_JOB_DESCRIPTION_CHARS),
           userCv: String(interviewProfile.userCv || "").slice(0, LIMITS.MAX_CV_CHARS),
+          specialInstructions: String(interviewProfile.specialInstructions || "").slice(0, LIMITS.MAX_SPECIAL_INSTRUCTIONS_CHARS),
         };
         room.scenario = {
           title: room.profile.targetPosition || "Interview Session",
@@ -1295,6 +1540,14 @@ function streamState(screenshotBase64: string, transcript: string) {
   // Vite development integration (local dev only — production bundle serves /dist)
   if (!isProduction) {
     console.log("Starting development mode with Vite HMR middleware...");
+    app.use("/downloads", express.static(path.join(process.cwd(), "public", "downloads"), {
+      setHeaders(res, filePath) {
+        const name = path.basename(filePath);
+        if (name.endsWith(".apk") || name.endsWith(".exe") || name.endsWith(".zip")) {
+          res.setHeader("Content-Disposition", `attachment; filename="${name}"`);
+        }
+      },
+    }));
     const vite = await createViteServer({
       server: {
         middlewareMode: true,
@@ -1311,7 +1564,18 @@ function streamState(screenshotBase64: string, transcript: string) {
       process.exit(1);
     }
     app.use(express.static(distPath));
-    app.get("*", (req, res) => {
+    app.use("/downloads", express.static(path.join(process.cwd(), "public", "downloads"), {
+      setHeaders(res, filePath) {
+        const name = path.basename(filePath);
+        if (name.endsWith(".apk") || name.endsWith(".exe") || name.endsWith(".zip")) {
+          res.setHeader("Content-Disposition", `attachment; filename="${name}"`);
+        }
+      },
+    }));
+    app.get("*", (req, res, next) => {
+      if (req.path.startsWith("/api/")) {
+        return next();
+      }
       res.sendFile(path.join(distPath, "index.html"));
     });
   }

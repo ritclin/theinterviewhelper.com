@@ -21,6 +21,7 @@ const EMPTY_PROFILE: InterviewProfile = {
   company: "",
   jobDescription: "",
   userCv: "",
+  specialInstructions: "",
 };
 
 function loadSavedProfile(): InterviewProfile {
@@ -34,6 +35,7 @@ function loadSavedProfile(): InterviewProfile {
       company: parsed.company || "",
       jobDescription: parsed.jobDescription || "",
       userCv: parsed.userCv || "",
+      specialInstructions: parsed.specialInstructions || "",
     };
   } catch {
     return EMPTY_PROFILE;
@@ -448,7 +450,7 @@ export default function App() {
       }
     }
 
-    socketRef.current.emit("create-room", (response: any) => {
+    socketRef.current.emit("create-room", { email: userEmail.trim().toLowerCase() }, (response: any) => {
       if (response.success) {
         setHostRoomCode(response.roomCode);
         setHostPaired(false);
@@ -456,6 +458,9 @@ export default function App() {
         setInputRoomCode(response.roomCode);
         fetchStats();
       } else {
+        if (response.code === "SUBSCRIPTION_REQUIRED") {
+          setShowCheckoutModal(true);
+        }
         alert(`Error generating room code: ${response.error}`);
       }
     });

@@ -75,11 +75,83 @@ Cloud platforms (Cloud Run, Railway, Render, Fly.io) can use the included `Docke
 
 ## Companion clients
 
-After deploying the relay server, point clients at your public URL instead of `localhost`:
+### 1. Subscribe (required — €20/month)
 
-- **Web dashboard**: uses the same origin automatically
-- **Windows client**: `python client.py --server https://your-app.example.com`
-- **Mobile client (Expo)**: set the server URL in the app UI
+Open **`/subscribe`** on your deployed site (e.g. `https://theinterviewhelpercom-production.up.railway.app/subscribe`), pay with Stripe, and use the **same email** everywhere.
+
+Pairing and AI answers are **blocked server-side** until subscription is active.
+
+### 2. Android app (host + personalized AI)
+
+The Android app is the **session host**: it creates the room, stores your profile (position, job description, CV), and displays AI answers.
+
+**Option A — Expo Go (quick test)**
+
+```bash
+cd mobile-client && npm install && npx expo start
+```
+
+Scan the QR code with Expo Go on Android.
+
+**Option B — Standalone APK (recommended for interviews)**
+
+```bash
+cd mobile-client
+npm install -g eas-cli
+eas login
+eas build -p android --profile preview
+```
+
+Install the downloaded APK on your phone.
+
+**In the app:**
+
+1. Enter your **billing email** → Check subscription
+2. Fill in **position, job description, CV** (paste or upload `.txt`)
+3. Tap **Start pairing session** → note the **6-digit room code**
+4. Open the **Live answers** tab during the interview
+
+### 3. Windows stealth capture (.exe)
+
+Captures **full-screen** interview questions and sends them to your Android app. Runs hidden in the system tray.
+
+**Build on Windows (once):**
+
+```powershell
+cd windows-client
+powershell -ExecutionPolicy Bypass -File build.ps1
+```
+
+**Silent install + auto-start on login:**
+
+```powershell
+powershell -ExecutionPolicy Bypass -File install.ps1 -RoomCode 123456
+```
+
+Replace `123456` with the code shown in the Android app.
+
+**Manual run:**
+
+```powershell
+dist\InterviewHelperCapture.exe --room 123456 --stealth
+```
+
+**Hotkey:** `Ctrl+Shift+Space` — captures the screen and sends it to your phone. If auto-analyze is enabled on Android, AI answers start immediately.
+
+### Download links (after deploy)
+
+| File | URL |
+|------|-----|
+| **Android APK** | `/downloads/interview-helper.apk` |
+| **Windows package** | `/downloads/interview-helper-windows.zip` |
+| **Windows .exe** | `/downloads/InterviewHelperCapture.exe` (built by GitHub Actions on Windows) |
+
+Rebuild Android APK locally: `bash scripts/build-android-apk.sh`
+
+```
+Subscribe (/subscribe) → Android: profile + start session → Windows: install with room code
+→ Ctrl+Shift+Space during interview → screenshot on phone → personalized AI answer
+```
 
 ## Health check
 
