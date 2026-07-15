@@ -12,9 +12,33 @@ import {
   Send, Terminal, Plus, HelpCircle, Key, Calendar, Trash2, 
   TrendingUp, Search, FileText, Copy, Check, Database, Activity, Download
 } from "lucide-react";
-import { INTERVIEW_SCENARIOS } from "./scenarios";
-import { InterviewScenario, SuggestionHistoryItem } from "./types";
+import { SuggestionHistoryItem, InterviewProfile } from "./types";
 import { MarkdownStreamViewer } from "./components/MarkdownStreamViewer";
+import { InterviewProfileForm } from "./components/InterviewProfileForm";
+
+const EMPTY_PROFILE: InterviewProfile = {
+  targetPosition: "",
+  company: "",
+  jobDescription: "",
+  userCv: "",
+};
+
+function loadSavedProfile(): InterviewProfile {
+  if (typeof window === "undefined") return EMPTY_PROFILE;
+  try {
+    const raw = localStorage.getItem("tih_interview_profile");
+    if (!raw) return EMPTY_PROFILE;
+    const parsed = JSON.parse(raw);
+    return {
+      targetPosition: parsed.targetPosition || "",
+      company: parsed.company || "",
+      jobDescription: parsed.jobDescription || "",
+      userCv: parsed.userCv || "",
+    };
+  } catch {
+    return EMPTY_PROFILE;
+  }
+}
 
 export default function App() {
   // Global Socket reference
@@ -43,7 +67,9 @@ export default function App() {
   // Panel A: Host Client Simulator State
   const [hostRoomCode, setHostRoomCode] = useState<string>("");
   const [hostPaired, setHostPaired] = useState(false);
-  const [selectedScenario, setSelectedScenario] = useState<InterviewScenario>(INTERVIEW_SCENARIOS[0]);
+  const [interviewProfile, setInterviewProfile] = useState<InterviewProfile>(loadSavedProfile);
+  const [liveTranscript, setLiveTranscript] = useState("");
+  const [screenContext, setScreenContext] = useState("");
   const [customPrompt, setCustomPrompt] = useState("");
   const [isStreamingFeed, setIsStreamingFeed] = useState(false);
 
@@ -215,6 +241,10 @@ export default function App() {
       console.warn("Failed to trigger webhook simulation:", err);
     }
   };
+
+  useEffect(() => {
+    localStorage.setItem("tih_interview_profile", JSON.stringify(interviewProfile));
+  }, [interviewProfile]);
 
   // After Stripe Checkout redirect — activate subscription immediately
   useEffect(() => {
@@ -464,9 +494,9 @@ export default function App() {
 
     setIsStreamingFeed(true);
     socketRef.current.emit("stream-data", {
-      imageText: selectedScenario.mockImageText,
-      imageName: selectedScenario.imageName,
-      audioTranscript: selectedScenario.transcript,
+      imageText: screenContext,
+      imageName: interviewProfile.targetPosition || "Interview screen",
+      audioTranscript: liveTranscript,
       timestamp: Date.now()
     });
 
@@ -475,22 +505,27 @@ export default function App() {
     }, 1200);
   };
 
-  // 4. Simulates Ctrl+Shift+Space Hotkey -> Triggers AI reasoning cycle on the Relay
   const handleTriggerAIEngine = () => {
     if (!socketRef.current || !hostRoomCode) {
       alert("Please generate a Room Code first.");
       return;
     }
 
+    if (!interviewProfile.targetPosition.trim()) {
+      alert("Please enter the position you are interviewing for in Your Interview Profile.");
+      return;
+    }
+
+    if (!liveTranscript.trim() && !screenContext.trim() && !customPrompt.trim()) {
+      alert("Add the interviewer's question, screen content, or a manual ask before triggering AI.");
+      return;
+    }
+
     socketRef.current.emit("request-ai-assist", {
       prompt: customPrompt || undefined,
-      image: selectedScenario.mockImageText, // Sending the text code as simulated image
-      audioTranscript: selectedScenario.transcript,
-      scenario: {
-        title: selectedScenario.title,
-        company: selectedScenario.company,
-        role: selectedScenario.role
-      }
+      screenContext: screenContext || undefined,
+      audioTranscript: liveTranscript || undefined,
+      interviewProfile,
     });
 
     setCustomPrompt("");
@@ -585,19 +620,32 @@ export default function App() {
         {activeSaaSTab === "platform" && (
           <div className="flex flex-col gap-6">
             
-            {/* Introductory Platform Info (Elegant, brief, informative) */}
             <div className="bg-slate-900/30 border border-slate-900 rounded-2xl p-6 flex flex-col md:flex-row items-start md:items-center justify-between gap-4">
               <div className="max-w-xl">
-                <h2 className="text-lg font-bold font-display text-white mb-1.5">Phase 1 Integration: Active WebSocket Relay</h2>
+                <h2 className="text-lg font-bold font-display text-white mb-1.5">Personalized Interview Assistant</h2>
                 <p className="text-sm text-slate-400 leading-relaxed">
-                  This interface serves as your full SaaS platform simulation rig. Below, you can spin up the 
-                  <strong> Windows capture client (host)</strong> and the <strong> mobile assistant app (client)</strong> side-by-side. 
-                  They connect via the real Socket.io server on port 3000 to test pairing, streaming, and Gemini reasoning.
+                  Set your target role, job description, and CV below. During the interview, paste the live question and what is on your screen — AI answers will be tailored to you and the position.
                 </p>
               </div>
               <div className="px-4 py-3 rounded-xl bg-indigo-950/20 border border-indigo-900/40 text-xs text-indigo-300 font-mono">
                 Active Relay Rooms: {activeRelayRoomsCount}
               </div>
+            </div>
+
+            <InterviewProfileForm
+              profile={interviewProfile}
+              onChange={setInterviewProfile}
+              liveTranscript={liveTranscript}
+              onLiveTranscriptChange={setLiveTranscript}
+              screenContext={screenContext}
+              onScreenContextChange={setScreenContext}
+            />
+
+            <div className="bg-slate-900/20 border border-slate-900 rounded-2xl p-6">
+              <h3 className="text-sm font-bold text-white font-display mb-1">Live Platform & Pairing</h3>
+              <p className="text-xs text-slate-500 mb-0">
+                Generate a room code and connect your mobile companion for real-time suggestions.
+              </p>
             </div>
 
             {/* SaaS Subscriber Account, Billing Hub, and Live Relay Registry (Phase 4 integration) */}
@@ -799,61 +847,22 @@ export default function App() {
                     )}
                   </div>
 
-                  {/* Scenario selection & input */}
                   {hostRoomCode && (
                     <div className="space-y-4">
-                      {/* Interview scenario dropdown */}
                       <div>
-                        <label className="block text-xs font-semibold text-slate-300 mb-1.5">SELECT INTERVIEW SCENARIO</label>
-                        <div className="grid grid-cols-1 sm:grid-cols-3 gap-2">
-                          {INTERVIEW_SCENARIOS.map((scenario) => (
-                            <button
-                              key={scenario.id}
-                              onClick={() => setSelectedScenario(scenario)}
-                              className={`p-3 rounded-lg text-left border transition-all cursor-pointer ${selectedScenario.id === scenario.id ? "bg-slate-900 border-indigo-500/70 shadow-md shadow-indigo-500/5" : "bg-slate-950/30 border-slate-900 hover:bg-slate-900/50 hover:border-slate-800"}`}
-                            >
-                              <div className="font-bold text-[11px] text-white truncate">{scenario.title}</div>
-                              <div className="text-[10px] text-slate-400 font-medium truncate mt-0.5">{scenario.company} ({scenario.role})</div>
-                            </button>
-                          ))}
-                        </div>
+                        <label className="block text-xs font-semibold text-slate-300 mb-1.5">QUICK MANUAL ASK (OPTIONAL)</label>
+                        <input 
+                          type="text" 
+                          placeholder="e.g. 'How should I answer this system design question?'"
+                          value={customPrompt}
+                          onChange={(e) => setCustomPrompt(e.target.value)}
+                          className="w-full bg-slate-950 border border-slate-900 focus:border-indigo-500 focus:ring-1 focus:ring-indigo-500 rounded-lg px-3.5 py-2 text-xs text-slate-200 placeholder-slate-600 outline-none transition-all"
+                          onKeyDown={(e) => { if (e.key === "Enter") handleTriggerAIEngine(); }}
+                        />
                       </div>
-
-                      {/* Mock Screenshot (visual preview) */}
-                      <div>
-                        <div className="flex items-center justify-between mb-1.5">
-                          <span className="text-xs font-semibold text-slate-300 uppercase tracking-wider">💻 Active Screenshot Simulation</span>
-                          <span className="text-[10px] text-indigo-400 font-mono font-bold bg-indigo-950/30 px-2 py-0.5 rounded border border-indigo-900/30">{selectedScenario.imageName}</span>
-                        </div>
-                        <div className="p-3 bg-slate-950 border border-slate-900 rounded-xl overflow-hidden max-h-[160px] relative group shadow-inner">
-                          <pre className="text-[11px] text-left text-slate-400 font-mono overflow-y-auto max-h-[140px] whitespace-pre-wrap select-none scrollbar-thin scrollbar-thumb-slate-900 scrollbar-track-transparent">
-                            {selectedScenario.mockImageText}
-                          </pre>
-                        </div>
-                      </div>
-
-                      {/* Interviewer Transcript */}
-                      <div>
-                        <span className="block text-xs font-semibold text-slate-300 uppercase tracking-wider mb-1.5">🎙️ Simulated Audio Input (Interviewer Speaking)</span>
-                        <div className="p-3 bg-slate-950/60 border border-slate-900 rounded-xl text-xs text-slate-300 italic leading-relaxed shadow-inner">
-                          "{selectedScenario.transcript}"
-                        </div>
-                      </div>
-
-                      {/* Manual Candidate Query */}
-                      <div>
-                        <label className="block text-xs font-semibold text-slate-300 mb-1.5">CANDIDATE MANUAL ASKS (OPTIONAL)</label>
-                        <div className="flex gap-2">
-                          <input 
-                            type="text" 
-                            placeholder="Type custom questions (e.g. 'explain time complexity of this', 'optimize space')"
-                            value={customPrompt}
-                            onChange={(e) => setCustomPrompt(e.target.value)}
-                            className="flex-1 bg-slate-950 border border-slate-900 focus:border-indigo-500 focus:ring-1 focus:ring-indigo-500 rounded-lg px-3.5 py-2 text-xs text-slate-200 placeholder-slate-600 outline-none transition-all"
-                            onKeyDown={(e) => { if (e.key === "Enter") handleTriggerAIEngine(); }}
-                          />
-                        </div>
-                      </div>
+                      <p className="text-[10px] text-slate-500">
+                        Profile, job description, CV, transcript, and screen content are configured in <strong className="text-slate-400">Your Interview Profile</strong> above.
+                      </p>
                     </div>
                   )}
                 </div>

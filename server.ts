@@ -100,6 +100,12 @@ async function startServer() {
     created: number;
     history: Array<{ role: string; content: string; timestamp: string }>;
     scenario?: { title: string; company: string; role: string; };
+    profile?: {
+      targetPosition: string;
+      company: string;
+      jobDescription: string;
+      userCv: string;
+    };
     aiInProgress?: boolean;
   }>();
 
@@ -323,7 +329,11 @@ LIMIT 50;
   // Helper to upsert completed or active sessions
   function saveOrUpdateSession(roomCode: string, room: any, isFinished = false) {
     const existingIndex = completedSessions.findIndex(s => s.roomCode === roomCode);
-    const scenario = room.scenario || { title: "Custom Coding Session", company: "Technical Practice", role: "Developer" };
+    const scenario = room.scenario || {
+      title: room.profile?.targetPosition || "Interview Session",
+      company: room.profile?.company || "Target Company",
+      role: room.profile?.targetPosition || "Candidate",
+    };
     
     const sessionData = {
       id: existingIndex >= 0 ? completedSessions[existingIndex].id : "sess_" + Math.random().toString(36).substring(2, 10),
@@ -342,7 +352,46 @@ LIMIT 50;
     }
   }
 
-  // Stripe Raw Webhook endpoint - MUST be defined before express.json()
+  function isLikelyBase64Image(value: string): boolean {
+    if (!value || value.length < 200) return false;
+    if (value.includes("base64,")) return true;
+    const sample = value.replace(/\s/g, "").slice(0, 400);
+    return /^[A-Za-z0-9+/=]+$/.test(sample) && sample.length > 200;
+  }
+
+  function buildPersonalizedSystemInstruction(profile?: {
+    targetPosition?: string;
+    company?: string;
+    jobDescription?: string;
+    userCv?: string;
+  }): string {
+    let instruction = `You are "The Interview Helper", an elite real-time interview coach.
+Your job is to help the candidate succeed in a live interview by analyzing the interviewer's questions, screen content, and the candidate's background.
+Deliver an ultra-optimized, condensed cheat-sheet in standard Markdown that the candidate can scan in 3-5 seconds.
+Always structure your output with these specific, scan-friendly sections:
+- **🎯 IDENTIFIED CHALLENGE**: Name the question, topic, or task being discussed.
+- **💡 OPTIMAL STRATEGY**: 2-3 bullet points with the best approach, complexity, data structures, or frameworks to mention.
+- **💻 GOLDEN CODE**: A minimal, clean code snippet when relevant (match the language in the question or job description).
+- **🗣️ TALKING POINTS**: 2 bullet points the candidate can say aloud — tie answers to their CV experience when relevant.
+
+Do not include greetings or long intros. Speed is everything. Keep the total length short and scannable.`;
+
+    if (profile?.targetPosition?.trim()) {
+      instruction += `\n\n--- CANDIDATE TARGET ROLE ---\nPosition: ${profile.targetPosition.trim()}`;
+      if (profile.company?.trim()) {
+        instruction += `\nCompany: ${profile.company.trim()}`;
+      }
+      if (profile.jobDescription?.trim()) {
+        instruction += `\n\n--- JOB DESCRIPTION ---\n${profile.jobDescription.trim().slice(0, LIMITS.MAX_JOB_DESCRIPTION_CHARS)}`;
+      }
+      if (profile.userCv?.trim()) {
+        instruction += `\n\n--- CANDIDATE CV / RESUME ---\n${profile.userCv.trim().slice(0, LIMITS.MAX_CV_CHARS)}`;
+      }
+      instruction += `\n\nTailor every answer to this role and job requirements. Prefer examples from the candidate's CV in talking points. Match seniority and tech stack from the job description.`;
+    }
+
+    return instruction;
+  }
   app.post("/api/webhooks", express.raw({ type: "application/json" }), async (req, res) => {
     const stripe = getStripe();
     const sig = req.headers["stripe-signature"];
@@ -905,7 +954,7 @@ LIMIT 50;
 
       room.aiInProgress = true;
 
-      const { prompt, image, audioTranscript, scenario } = payload || {};
+      const { prompt, image, audioTranscript, scenario, interviewProfile, screenContext } = payload || {};
       if (typeof prompt === "string" && prompt.length > LIMITS.MAX_PROMPT_CHARS) {
         room.aiInProgress = false;
         socket.emit("ai-error", { error: "Prompt exceeds maximum length." });
@@ -916,33 +965,57 @@ LIMIT 50;
         socket.emit("ai-error", { error: "Transcript exceeds maximum length." });
         return;
       }
-      if (image && estimateBase64Bytes(String(image)) > LIMITS.MAX_IMAGE_BYTES) {
+      if (typeof screenContext === "string" && screenContext.length > LIMITS.MAX_SCREEN_CONTEXT_CHARS) {
         room.aiInProgress = false;
-        socket.emit("ai-error", { error: "Image payload exceeds 5MB limit." });
+        socket.emit("ai-error", { error: "Screen context exceeds maximum length." });
         return;
       }
-
-      if (scenario && typeof scenario === "object") {
+      if (interviewProfile && typeof interviewProfile === "object") {
+        room.profile = {
+          targetPosition: String(interviewProfile.targetPosition || "").slice(0, 200),
+          company: String(interviewProfile.company || "").slice(0, 100),
+          jobDescription: String(interviewProfile.jobDescription || "").slice(0, LIMITS.MAX_JOB_DESCRIPTION_CHARS),
+          userCv: String(interviewProfile.userCv || "").slice(0, LIMITS.MAX_CV_CHARS),
+        };
+        room.scenario = {
+          title: room.profile.targetPosition || "Interview Session",
+          company: room.profile.company || "Target Company",
+          role: room.profile.targetPosition || "Candidate",
+        };
+      } else if (scenario && typeof scenario === "object") {
         room.scenario = {
           title: String(scenario.title || "").slice(0, 200),
           company: String(scenario.company || "").slice(0, 100),
           role: String(scenario.role || "").slice(0, 100),
         };
       }
+      if (image && isLikelyBase64Image(String(image)) && estimateBase64Bytes(String(image)) > LIMITS.MAX_IMAGE_BYTES) {
+        room.aiInProgress = false;
+        socket.emit("ai-error", { error: "Image payload exceeds 5MB limit." });
+        return;
+      }
+
+      if (interviewProfile?.targetPosition && typeof interviewProfile.jobDescription === "string" && interviewProfile.jobDescription.length > LIMITS.MAX_JOB_DESCRIPTION_CHARS) {
+        room.aiInProgress = false;
+        socket.emit("ai-error", { error: "Job description exceeds maximum length." });
+        return;
+      }
+      if (interviewProfile?.userCv && typeof interviewProfile.userCv === "string" && interviewProfile.userCv.length > LIMITS.MAX_CV_CHARS) {
+        room.aiInProgress = false;
+        socket.emit("ai-error", { error: "CV exceeds maximum length." });
+        return;
+      }
+      if (image && !isLikelyBase64Image(String(image)) && estimateBase64Bytes(String(image)) > LIMITS.MAX_IMAGE_BYTES) {
+        room.aiInProgress = false;
+        socket.emit("ai-error", { error: "Image payload exceeds 5MB limit." });
+        return;
+      }
+
       console.log(`Generating optimization suggestion for room ${roomCode}...`);
 
       io.to(`room-${roomCode}`).emit("ai-start");
 
-      const systemInstruction = `You are "The Interview Helper", an elite real-time technical interview optimization expert. 
-Your target is to help the candidate by analyzing their screen (screenshots of code/question text) and the interviewer's spoken words (audio transcript).
-Deliver an ultra-optimized, condensed cheat-sheet in standard Markdown that the candidate can scan in 3-5 seconds.
-Always structure your output with these specific, scan-friendly sections:
-- **🎯 IDENTIFIED CHALLENGE**: Name of the algorithm, question, or technology concept being discussed.
-- **💡 OPTIMAL STRATEGY**: 2-3 bullet points detailing the best Time/Space complexity, data structures, and edge cases to mention.
-- **💻 GOLDEN CODE**: An ultra-clean, minimal code snippet (Typescript/Javascript/Python as appropriate) implementing the core logic of the optimal solution.
-- **🗣️ TALKING POINTS**: 2 quick bullet points of phrasing or wording to use (e.g., "Mention how we can optimize this from O(N^2) using a Hash Map...").
-
-Do not include greetings, explanations of code details, or long intros. Speed is everything. Keep the total length short and easy to read.`;
+      const systemInstruction = buildPersonalizedSystemInstruction(room.profile || interviewProfile);
 
       // Build Gemini contents
       let aiResponseStream = null;
@@ -953,10 +1026,11 @@ Do not include greetings, explanations of code details, or long intros. Speed is
       if (aiClient) {
         try {
           const contents: any[] = [];
-          
-          if (image) {
-            // Check if base64 contains metadata prefix, strip it if so
-            const base64Data = image.includes("base64,") ? image.split("base64,")[1] : image;
+          const screenText = String(screenContext || "").trim();
+          const imageValue = String(image || "").trim();
+
+          if (imageValue && isLikelyBase64Image(imageValue)) {
+            const base64Data = imageValue.includes("base64,") ? imageValue.split("base64,")[1] : imageValue;
             contents.push({
               inlineData: {
                 data: base64Data,
@@ -965,12 +1039,20 @@ Do not include greetings, explanations of code details, or long intros. Speed is
             });
           }
 
-          let promptText = "Review the active interview state and suggest the optimal next steps.";
+          let promptText = "Review the active interview state and suggest the optimal next steps for this candidate.";
+          if (room.profile?.targetPosition) {
+            promptText += `\nTarget role: ${room.profile.targetPosition}`;
+          }
+          if (screenText) {
+            promptText += `\n\nScreen / code / question content:\n${screenText.slice(0, LIMITS.MAX_SCREEN_CONTEXT_CHARS)}`;
+          } else if (imageValue && !isLikelyBase64Image(imageValue)) {
+            promptText += `\n\nScreen / code / question content:\n${imageValue.slice(0, LIMITS.MAX_SCREEN_CONTEXT_CHARS)}`;
+          }
           if (audioTranscript) {
-            promptText += `\nInterviewer spoken content (Transcript): "${String(audioTranscript).slice(0, LIMITS.MAX_TRANSCRIPT_CHARS)}"`;
+            promptText += `\n\nInterviewer spoken content (Transcript): "${String(audioTranscript).slice(0, LIMITS.MAX_TRANSCRIPT_CHARS)}"`;
           }
           if (prompt) {
-            promptText += `\nDirect Candidate request: "${String(prompt).slice(0, LIMITS.MAX_PROMPT_CHARS)}"`;
+            promptText += `\n\nDirect candidate request: "${String(prompt).slice(0, LIMITS.MAX_PROMPT_CHARS)}"`;
           }
           contents.push({ text: promptText });
 
