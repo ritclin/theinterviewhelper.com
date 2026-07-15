@@ -226,19 +226,53 @@ async function startServer() {
 
   loadSubscriptionsFromDisk();
 
-  function activateSubscription(email: string, subscriptionId?: string) {
+  function activateSubscription(email: string, subscriptionId?: string, currentPeriodEndMs?: number) {
     const normalized = email.toLowerCase().trim();
     if (!normalized) return null;
     const sub = {
       status: "active" as const,
       email: normalized,
-      currentPeriodEnd: Date.now() + 30 * 24 * 60 * 60 * 1000,
+      currentPeriodEnd: currentPeriodEndMs && currentPeriodEndMs > Date.now()
+        ? currentPeriodEndMs
+        : Date.now() + 30 * 24 * 60 * 60 * 1000,
       subscriptionId: subscriptionId || "sub_" + Math.random().toString(36).substring(2, 10),
     };
     subscriptions.set(normalized, sub);
     persistSubscriptionsToDisk();
     console.log(`[Billing] Subscription activated for: ${normalized}`);
     return sub;
+  }
+
+  async function syncSubscriptionFromStripe(targetEmail: string) {
+    const normalized = targetEmail.toLowerCase().trim();
+    if (!normalized) return null;
+
+    const stripe = getStripe();
+    if (!stripe) return null;
+
+    try {
+      const customers = await stripe.customers.list({ email: normalized, limit: 5 });
+      for (const customer of customers.data) {
+        const activeSubs = await stripe.subscriptions.list({
+          customer: customer.id,
+          status: "active",
+          limit: 1,
+        });
+        const trialingSubs = await stripe.subscriptions.list({
+          customer: customer.id,
+          status: "trialing",
+          limit: 1,
+        });
+        const match = activeSubs.data[0] || trialingSubs.data[0];
+        if (match) {
+          const periodEnd = match.current_period_end ? match.current_period_end * 1000 : undefined;
+          return activateSubscription(normalized, match.id, periodEnd);
+        }
+      }
+    } catch (err) {
+      console.warn("[Billing] syncSubscriptionFromStripe error:", err);
+    }
+    return null;
   }
 
   async function resolveStripeCustomerEmail(stripe: Stripe, customerRef: unknown): Promise<string> {
@@ -715,8 +749,8 @@ Rules: No greetings. Scannable in 5-8 seconds. Be accurate to the candidate's se
     if (!email) {
       return res.status(400).json({ success: false, error: "Email query parameter is required." });
     }
-    const sub = subscriptions.get(email) || { status: "none", email, currentPeriodEnd: 0 };
-    res.json(sub);
+    const sub = subscriptions.get(email) || { status: "none" as const, email, currentPeriodEnd: 0 };
+    res.json({ success: true, ...sub });
   });
 
   app.post("/api/stripe/confirm-session", async (req, res) => {
@@ -783,22 +817,9 @@ Rules: No greetings. Scannable in 5-8 seconds. Be accurate to the candidate's se
         });
       }
 
-      for (const customer of customers.data) {
-        const activeSubs = await stripe.subscriptions.list({
-          customer: customer.id,
-          status: "active",
-          limit: 1,
-        });
-        const trialingSubs = await stripe.subscriptions.list({
-          customer: customer.id,
-          status: "trialing",
-          limit: 1,
-        });
-        const match = activeSubs.data[0] || trialingSubs.data[0];
-        if (match) {
-          const subscription = activateSubscription(targetEmail, match.id);
-          return res.json({ success: true, subscription, source: "stripe-sync" });
-        }
+      const subscription = await syncSubscriptionFromStripe(targetEmail);
+      if (subscription) {
+        return res.json({ success: true, subscription, source: "stripe-sync" });
       }
 
       res.json({
@@ -1063,7 +1084,7 @@ Rules: No greetings. Scannable in 5-8 seconds. Be accurate to the candidate's se
     });
 
     // 1. Create Room (Host — Android app or web dashboard; requires active subscription)
-    socket.on("create-room", (payload, callback) => {
+    socket.on("create-room", async (payload, callback) => {
       try {
         let email = "";
         let cb: ((response: unknown) => void) | undefined = callback;
@@ -1079,10 +1100,13 @@ Rules: No greetings. Scannable in 5-8 seconds. Be accurate to the candidate's se
           return;
         }
         if (!hasActiveSubscription(email)) {
+          await syncSubscriptionFromStripe(email);
+        }
+        if (!hasActiveSubscription(email)) {
           if (cb) {
             cb({
               success: false,
-              error: `Active €${SUBSCRIPTION_PRICE_EUR}/month subscription required. Subscribe on the website.`,
+              error: `Active €${SUBSCRIPTION_PRICE_EUR}/month subscription required. Subscribe on the website, then tap Refresh from Stripe.`,
               code: "SUBSCRIPTION_REQUIRED",
             });
           }

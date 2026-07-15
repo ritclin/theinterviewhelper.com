@@ -123,31 +123,62 @@ export default function App() {
       const base = serverUrl.replace(/\/$/, "");
       const res = await fetch(`${base}/api/stripe/status?email=${encodeURIComponent(targetEmail)}`);
       const data = await res.json();
-      if (data.success) return data as SubscriptionStatus;
+      if (data.success && typeof data.status === "string") {
+        return {
+          status: data.status,
+          email: data.email || targetEmail,
+          currentPeriodEnd: data.currentPeriodEnd || 0,
+        };
+      }
+      if (typeof data.status === "string") {
+        return data as SubscriptionStatus;
+      }
     } catch {
       // ignore
     }
     return null;
   };
 
-  const checkSubscription = async () => {
+  const ensureSubscriptionActive = async (): Promise<boolean> => {
     const target = email.trim().toLowerCase();
     if (!target) {
       Alert.alert("Email required", "Enter the same email you used for payment.");
       return false;
     }
     setCheckingSub(true);
-    const sub = await fetchSubscription(target);
-    setCheckingSub(false);
-    if (sub) setSubscription(sub);
-    if (sub?.status === "active") return true;
-    Alert.alert(
-      "Subscription required",
-      "No active €20/month subscription found. Subscribe at /subscribe on the website, then tap Refresh subscription.",
-      [{ text: "OK" }]
-    );
-    return false;
+    try {
+      const base = serverUrl.replace(/\/$/, "");
+      const syncRes = await fetch(`${base}/api/stripe/sync-subscription`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ email: target }),
+      });
+      const syncData = await syncRes.json();
+      if (syncData.success && syncData.subscription) {
+        setSubscription(syncData.subscription);
+        return true;
+      }
+
+      const sub = await fetchSubscription(target);
+      if (sub) setSubscription(sub);
+      if (sub?.status === "active") return true;
+
+      Alert.alert(
+        "Subscription required",
+        syncData.error ||
+          "No active €20/month subscription found. Subscribe on the website, then tap Refresh from Stripe.",
+        [{ text: "OK" }]
+      );
+      return false;
+    } catch {
+      Alert.alert("Error", "Could not reach billing server.");
+      return false;
+    } finally {
+      setCheckingSub(false);
+    }
   };
+
+  const checkSubscription = async () => ensureSubscriptionActive();
 
   const syncSubscription = async () => {
     const target = email.trim().toLowerCase();
@@ -326,7 +357,7 @@ export default function App() {
   );
 
   const startSession = async () => {
-    if (!(await checkSubscription())) return;
+    if (!(await ensureSubscriptionActive())) return;
     if (!profile.targetPosition.trim()) {
       Alert.alert("Profile", "Enter the position you are interviewing for.");
       setActiveTab("setup");
