@@ -154,6 +154,10 @@ async function startServer() {
   const hostDisconnectTimers = new Map<string, NodeJS.Timeout>();
   const HOST_RECONNECT_GRACE_MS = 90 * 1000;
 
+  // Memory bounds so a busy/long-lived server can't grow unbounded under load.
+  const MAX_COMPLETED_SESSIONS = 200;
+  const MAX_ROOM_HISTORY = 50;
+
   function clearHostDisconnectTimer(roomCode: string) {
     const timer = hostDisconnectTimers.get(roomCode);
     if (timer) {
@@ -500,6 +504,17 @@ LIMIT 50;
       completedSessions[existingIndex] = sessionData;
     } else {
       completedSessions.unshift(sessionData);
+      // Bound memory: keep only the most recent sessions.
+      if (completedSessions.length > MAX_COMPLETED_SESSIONS) {
+        completedSessions.length = MAX_COMPLETED_SESSIONS;
+      }
+    }
+  }
+
+  // Keep a room's in-memory transcript bounded so long sessions can't grow without limit.
+  function capRoomHistory(room: { history: unknown[] }) {
+    if (room.history.length > MAX_ROOM_HISTORY) {
+      room.history.splice(0, room.history.length - MAX_ROOM_HISTORY);
     }
   }
 
@@ -1460,6 +1475,7 @@ Rules: No greetings. Scannable in 5-8 seconds. Be accurate to the candidate's se
             content: completedText,
             timestamp: new Date().toLocaleTimeString()
           });
+          capRoomHistory(room);
 
           saveOrUpdateSession(roomCode, room, false);
 
@@ -1673,6 +1689,7 @@ function streamState(screenshotBase64: string, transcript: string) {
       content: simText,
       timestamp: new Date().toLocaleTimeString()
     });
+    capRoomHistory(room);
 
     // Update active session records (Phase 5)
     saveOrUpdateSession(roomCode, room, false);
@@ -1739,6 +1756,15 @@ function streamState(screenshotBase64: string, transcript: string) {
     console.log(`====================================================`);
   });
 }
+
+// Keep the relay alive on stray errors rather than crashing the whole process
+// (a single bad socket payload or rejected promise shouldn't take down every room).
+process.on("unhandledRejection", (reason) => {
+  console.error("[Process] Unhandled promise rejection:", reason);
+});
+process.on("uncaughtException", (err) => {
+  console.error("[Process] Uncaught exception:", err);
+});
 
 startServer().catch((err) => {
   console.error("Critical server startup error:", err);
