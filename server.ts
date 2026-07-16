@@ -139,6 +139,7 @@ async function startServer() {
       specialInstructions: string;
     };
     aiInProgress?: boolean;
+    transcribeInProgress?: boolean;
   }>();
 
   const joinAttemptsByIp = new Map<string, { count: number; resetAt: number }>();
@@ -521,7 +522,9 @@ LIMIT 50;
   function isLikelyBase64Image(value: string): boolean {
     if (!value || value.length < 200) return false;
     if (value.includes("base64,")) return true;
-    const sample = value.replace(/\s/g, "").slice(0, 400);
+    // Only inspect the head of the string so a ~5MB payload can't trigger a
+    // full-length regex scan on the event loop.
+    const sample = value.slice(0, 800).replace(/\s/g, "").slice(0, 400);
     return /^[A-Za-z0-9+/=]+$/.test(sample) && sample.length > 200;
   }
 
@@ -708,8 +711,8 @@ Rules: No greetings. Scannable in 5-8 seconds. Be accurate to the candidate's se
     res.json({
       success: true,
       downloads: {
-        windowsZip: zip.valid ? "/downloads/interview-helper-windows.zip" : "/downloads/interview-helper-windows.zip",
-        windowsExe: exe.valid ? "/downloads/InterviewHelperCapture.exe" : "/downloads/InterviewHelperCapture.exe",
+        windowsZip: "/downloads/interview-helper-windows.zip",
+        windowsExe: "/downloads/InterviewHelperCapture.exe",
         androidApk: apk.valid ? "/downloads/interview-helper.apk" : (process.env.ANDROID_APK_URL || "/downloads/interview-helper.apk"),
         androidPlayStore: process.env.ANDROID_PLAY_STORE_URL || null,
         filesPresent: {
@@ -886,9 +889,15 @@ Rules: No greetings. Scannable in 5-8 seconds. Be accurate to the candidate's se
       return res.status(400).json({ success: false, error: "A valid billing email is required." });
     }
     const stripe = getStripe();
-    const origin = typeof req.headers.origin === "string" ? req.headers.origin : (process.env.APP_URL || "http://localhost:3000");
-    const safeSuccessUrl = sanitizeRedirectUrl(successUrl, origin);
-    const safeCancelUrl = sanitizeRedirectUrl(cancelUrl, origin);
+    // Validate redirects against the SERVER-configured APP_URL (not the caller's
+    // Origin header, which is attacker-controlled) to prevent open redirects.
+    const appUrl = process.env.APP_URL?.trim();
+    const trustedOrigin =
+      appUrl && appUrl !== "MY_APP_URL" && appUrl.startsWith("http")
+        ? new URL(appUrl).origin
+        : (typeof req.headers.origin === "string" ? req.headers.origin : "http://localhost:3000");
+    const safeSuccessUrl = sanitizeRedirectUrl(successUrl, trustedOrigin);
+    const safeCancelUrl = sanitizeRedirectUrl(cancelUrl, trustedOrigin);
 
     if (stripe) {
       try {
@@ -1298,26 +1307,36 @@ Rules: No greetings. Scannable in 5-8 seconds. Be accurate to the candidate's se
       let forwardPayload = { ...payload };
 
       if (payload?.audioBase64 && hasActiveSubscription(room.ownerEmail) && aiClient) {
-        try {
-          const raw = String(payload.audioBase64).includes("base64,")
-            ? String(payload.audioBase64).split("base64,")[1]
-            : String(payload.audioBase64);
-          if (estimateBase64Bytes(raw) <= LIMITS.MAX_AUDIO_BYTES) {
-            const geminiModel = process.env.GEMINI_MODEL || "gemini-2.5-flash";
-            const result = await aiClient.models.generateContent({
-              model: geminiModel,
-              contents: [
-                { inlineData: { mimeType: payload.audioMimeType || "audio/wav", data: raw } },
-                { text: "Transcribe spoken interview content. Return only the transcript." },
-              ],
-            });
-            const transcript = (result.text || "").trim();
-            if (transcript) forwardPayload.audioTranscript = transcript;
+        // Serialize transcription per room: drop a chunk's audio if one is already
+        // in flight so a flood of stream-data can't stack concurrent Gemini calls
+        // (runaway cost / event-loop pressure).
+        if (room.transcribeInProgress) {
+          delete forwardPayload.audioBase64;
+        } else {
+          room.transcribeInProgress = true;
+          try {
+            const raw = String(payload.audioBase64).includes("base64,")
+              ? String(payload.audioBase64).split("base64,")[1]
+              : String(payload.audioBase64);
+            if (estimateBase64Bytes(raw) <= LIMITS.MAX_AUDIO_BYTES) {
+              const geminiModel = process.env.GEMINI_MODEL || "gemini-2.5-flash";
+              const result = await aiClient.models.generateContent({
+                model: geminiModel,
+                contents: [
+                  { inlineData: { mimeType: payload.audioMimeType || "audio/wav", data: raw } },
+                  { text: "Transcribe spoken interview content. Return only the transcript." },
+                ],
+              });
+              const transcript = (result.text || "").trim();
+              if (transcript) forwardPayload.audioTranscript = transcript;
+            }
+          } catch (err: any) {
+            console.warn("[Stream] Audio transcribe skipped:", err.message);
+          } finally {
+            room.transcribeInProgress = false;
           }
-        } catch (err: any) {
-          console.warn("[Stream] Audio transcribe skipped:", err.message);
+          delete forwardPayload.audioBase64;
         }
-        delete forwardPayload.audioBase64;
       }
 
       io.to(`room-${roomCode}`).emit("stream-feed", forwardPayload);
