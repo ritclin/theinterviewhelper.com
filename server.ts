@@ -139,6 +139,7 @@ async function startServer() {
       specialInstructions: string;
     };
     aiInProgress?: boolean;
+    transcribeInProgress?: boolean;
   }>();
 
   const joinAttemptsByIp = new Map<string, { count: number; resetAt: number }>();
@@ -146,6 +147,35 @@ async function startServer() {
 
   // Map of socket.id -> roomCode to handle cleanups
   const socketToRoom = new Map<string, string>();
+
+  // Rooms whose host has temporarily dropped: roomCode -> deletion timer.
+  // Gives a paired host a grace window to reconnect (mobile screen-lock, wifi
+  // handoff, app backgrounding) and reclaim the SAME code, instead of destroying
+  // the room and invalidating the code the Windows client is still holding.
+  const hostDisconnectTimers = new Map<string, NodeJS.Timeout>();
+  const HOST_RECONNECT_GRACE_MS = 90 * 1000;
+
+  // Memory bounds so a busy/long-lived server can't grow unbounded under load.
+  const MAX_COMPLETED_SESSIONS = 200;
+  const MAX_ROOM_HISTORY = 50;
+
+  function clearHostDisconnectTimer(roomCode: string) {
+    const timer = hostDisconnectTimers.get(roomCode);
+    if (timer) {
+      clearTimeout(timer);
+      hostDisconnectTimers.delete(roomCode);
+    }
+  }
+
+  function finalizeAndDeleteRoom(roomCode: string, reason: string) {
+    const room = rooms.get(roomCode);
+    clearHostDisconnectTimer(roomCode);
+    if (!room) return;
+    io.to(`room-${roomCode}`).emit("room-closed", { message: reason });
+    if (room.history.length > 0) saveOrUpdateSession(roomCode, room, true);
+    rooms.delete(roomCode);
+    console.log(`Room ${roomCode} finalized and deleted: ${reason}`);
+  }
 
   // --- SaaS Stripe & Subscriptions Engine ---
   let stripeClient: Stripe | null = null;
@@ -475,13 +505,26 @@ LIMIT 50;
       completedSessions[existingIndex] = sessionData;
     } else {
       completedSessions.unshift(sessionData);
+      // Bound memory: keep only the most recent sessions.
+      if (completedSessions.length > MAX_COMPLETED_SESSIONS) {
+        completedSessions.length = MAX_COMPLETED_SESSIONS;
+      }
+    }
+  }
+
+  // Keep a room's in-memory transcript bounded so long sessions can't grow without limit.
+  function capRoomHistory(room: { history: unknown[] }) {
+    if (room.history.length > MAX_ROOM_HISTORY) {
+      room.history.splice(0, room.history.length - MAX_ROOM_HISTORY);
     }
   }
 
   function isLikelyBase64Image(value: string): boolean {
     if (!value || value.length < 200) return false;
     if (value.includes("base64,")) return true;
-    const sample = value.replace(/\s/g, "").slice(0, 400);
+    // Only inspect the head of the string so a ~5MB payload can't trigger a
+    // full-length regex scan on the event loop.
+    const sample = value.slice(0, 800).replace(/\s/g, "").slice(0, 400);
     return /^[A-Za-z0-9+/=]+$/.test(sample) && sample.length > 200;
   }
 
@@ -668,8 +711,8 @@ Rules: No greetings. Scannable in 5-8 seconds. Be accurate to the candidate's se
     res.json({
       success: true,
       downloads: {
-        windowsZip: zip.valid ? "/downloads/interview-helper-windows.zip" : "/downloads/interview-helper-windows.zip",
-        windowsExe: exe.valid ? "/downloads/InterviewHelperCapture.exe" : "/downloads/InterviewHelperCapture.exe",
+        windowsZip: "/downloads/interview-helper-windows.zip",
+        windowsExe: "/downloads/InterviewHelperCapture.exe",
         androidApk: apk.valid ? "/downloads/interview-helper.apk" : (process.env.ANDROID_APK_URL || "/downloads/interview-helper.apk"),
         androidPlayStore: process.env.ANDROID_PLAY_STORE_URL || null,
         filesPresent: {
@@ -846,9 +889,15 @@ Rules: No greetings. Scannable in 5-8 seconds. Be accurate to the candidate's se
       return res.status(400).json({ success: false, error: "A valid billing email is required." });
     }
     const stripe = getStripe();
-    const origin = typeof req.headers.origin === "string" ? req.headers.origin : (process.env.APP_URL || "http://localhost:3000");
-    const safeSuccessUrl = sanitizeRedirectUrl(successUrl, origin);
-    const safeCancelUrl = sanitizeRedirectUrl(cancelUrl, origin);
+    // Validate redirects against the SERVER-configured APP_URL (not the caller's
+    // Origin header, which is attacker-controlled) to prevent open redirects.
+    const appUrl = process.env.APP_URL?.trim();
+    const trustedOrigin =
+      appUrl && appUrl !== "MY_APP_URL" && appUrl.startsWith("http")
+        ? new URL(appUrl).origin
+        : (typeof req.headers.origin === "string" ? req.headers.origin : "http://localhost:3000");
+    const safeSuccessUrl = sanitizeRedirectUrl(successUrl, trustedOrigin);
+    const safeCancelUrl = sanitizeRedirectUrl(cancelUrl, trustedOrigin);
 
     if (stripe) {
       try {
@@ -1033,9 +1082,14 @@ Rules: No greetings. Scannable in 5-8 seconds. Be accurate to the candidate's se
     for (const [code, data] of rooms.entries()) {
       if (now - data.created > 2 * 60 * 60 * 1000) {
         io.to(`room-${code}`).emit("room-expired", { message: "Room expired due to inactivity." });
+        clearHostDisconnectTimer(code);
         rooms.delete(code);
         console.log(`Garbage collected inactive room: ${code}`);
       }
+    }
+    // Sweep expired room-join rate-limit entries so the map can't grow unbounded.
+    for (const [ip, entry] of joinAttemptsByIp.entries()) {
+      if (now > entry.resetAt) joinAttemptsByIp.delete(ip);
     }
   }, 15 * 60 * 1000);
 
@@ -1135,6 +1189,47 @@ Rules: No greetings. Scannable in 5-8 seconds. Be accurate to the candidate's se
       }
     });
 
+    // 1b. Resume Room (host reconnected within the grace window — reclaim same code)
+    socket.on("resume-room", async (payload, callback) => {
+      try {
+        const email = String(payload?.email || "").toLowerCase().trim();
+        const roomCode = payload?.roomCode;
+        if (!isValidRoomCode(roomCode) || !email) {
+          if (callback) callback({ success: false, error: "Email and valid room code required.", code: "ROOM_GONE" });
+          return;
+        }
+        const room = rooms.get(roomCode);
+        if (!room || room.ownerEmail !== email) {
+          // Room expired or not owned by this email — caller should create a fresh one.
+          if (callback) callback({ success: false, error: "Session expired. Starting a new room.", code: "ROOM_GONE" });
+          return;
+        }
+        if (!hasActiveSubscription(email)) {
+          await syncSubscriptionFromStripe(email);
+        }
+        if (!hasActiveSubscription(email)) {
+          if (callback) callback({ success: false, error: "Active subscription required.", code: "SUBSCRIPTION_REQUIRED" });
+          return;
+        }
+
+        clearHostDisconnectTimer(roomCode);
+        room.hostSocketId = socket.id;
+        socketToRoom.set(socket.id, roomCode);
+        socket.join(`room-${roomCode}`);
+        const clientsCount = room.clientSocketIds.length;
+
+        // Re-notify the room so a still-connected Windows client (and the host UI)
+        // reflect the restored pairing without re-entering the code.
+        io.to(`room-${roomCode}`).emit("paired", { roomCode, clientsCount, hostSocketId: socket.id });
+
+        console.log(`Host resumed room ${roomCode} (${email}), clients=${clientsCount}`);
+        if (callback) callback({ success: true, roomCode, history: room.history, clientsCount });
+      } catch (err: any) {
+        console.error("Error resuming room:", err);
+        if (callback) callback({ success: false, error: err.message, code: "ROOM_GONE" });
+      }
+    });
+
     // 2. Join Room (Mobile / Assistant Client)
     socket.on("join-room", (payload, callback) => {
       try {
@@ -1167,8 +1262,10 @@ Rules: No greetings. Scannable in 5-8 seconds. Be accurate to the candidate's se
           return;
         }
 
-        // Add client to room
-        room.clientSocketIds.push(socket.id);
+        // Add client to room (dedupe so reconnects/re-joins don't inflate the count)
+        if (!room.clientSocketIds.includes(socket.id)) {
+          room.clientSocketIds.push(socket.id);
+        }
         socketToRoom.set(socket.id, roomCode);
         socket.join(`room-${roomCode}`);
 
@@ -1210,26 +1307,36 @@ Rules: No greetings. Scannable in 5-8 seconds. Be accurate to the candidate's se
       let forwardPayload = { ...payload };
 
       if (payload?.audioBase64 && hasActiveSubscription(room.ownerEmail) && aiClient) {
-        try {
-          const raw = String(payload.audioBase64).includes("base64,")
-            ? String(payload.audioBase64).split("base64,")[1]
-            : String(payload.audioBase64);
-          if (estimateBase64Bytes(raw) <= LIMITS.MAX_AUDIO_BYTES) {
-            const geminiModel = process.env.GEMINI_MODEL || "gemini-2.5-flash";
-            const result = await aiClient.models.generateContent({
-              model: geminiModel,
-              contents: [
-                { inlineData: { mimeType: payload.audioMimeType || "audio/wav", data: raw } },
-                { text: "Transcribe spoken interview content. Return only the transcript." },
-              ],
-            });
-            const transcript = (result.text || "").trim();
-            if (transcript) forwardPayload.audioTranscript = transcript;
+        // Serialize transcription per room: drop a chunk's audio if one is already
+        // in flight so a flood of stream-data can't stack concurrent Gemini calls
+        // (runaway cost / event-loop pressure).
+        if (room.transcribeInProgress) {
+          delete forwardPayload.audioBase64;
+        } else {
+          room.transcribeInProgress = true;
+          try {
+            const raw = String(payload.audioBase64).includes("base64,")
+              ? String(payload.audioBase64).split("base64,")[1]
+              : String(payload.audioBase64);
+            if (estimateBase64Bytes(raw) <= LIMITS.MAX_AUDIO_BYTES) {
+              const geminiModel = process.env.GEMINI_MODEL || "gemini-2.5-flash";
+              const result = await aiClient.models.generateContent({
+                model: geminiModel,
+                contents: [
+                  { inlineData: { mimeType: payload.audioMimeType || "audio/wav", data: raw } },
+                  { text: "Transcribe spoken interview content. Return only the transcript." },
+                ],
+              });
+              const transcript = (result.text || "").trim();
+              if (transcript) forwardPayload.audioTranscript = transcript;
+            }
+          } catch (err: any) {
+            console.warn("[Stream] Audio transcribe skipped:", err.message);
+          } finally {
+            room.transcribeInProgress = false;
           }
-        } catch (err: any) {
-          console.warn("[Stream] Audio transcribe skipped:", err.message);
+          delete forwardPayload.audioBase64;
         }
-        delete forwardPayload.audioBase64;
       }
 
       io.to(`room-${roomCode}`).emit("stream-feed", forwardPayload);
@@ -1387,6 +1494,7 @@ Rules: No greetings. Scannable in 5-8 seconds. Be accurate to the candidate's se
             content: completedText,
             timestamp: new Date().toLocaleTimeString()
           });
+          capRoomHistory(room);
 
           saveOrUpdateSession(roomCode, room, false);
 
@@ -1415,18 +1523,23 @@ Rules: No greetings. Scannable in 5-8 seconds. Be accurate to the candidate's se
         const room = rooms.get(roomCode);
         if (room) {
           if (room.hostSocketId === socket.id) {
-            // Host left - destroy the room completely
-            io.to(`room-${roomCode}`).emit("room-closed", {
-              message: "The host capture client disconnected. Pairing terminated."
+            // Host dropped - keep the room alive for a grace window so a
+            // reconnecting host can reclaim the SAME code via "resume-room".
+            // Notify the room of a transient drop (not a hard close) so clients
+            // can show "reconnecting" instead of tearing down the session.
+            io.to(`room-${roomCode}`).emit("host-disconnected", {
+              message: "Host connection lost. Waiting for reconnect…",
+              graceMs: HOST_RECONNECT_GRACE_MS,
             });
-            
-            // Finalize active session in records if suggestions were generated (Phase 5)
-            if (room.history.length > 0) {
-              saveOrUpdateSession(roomCode, room, true);
-            }
-            
-            rooms.delete(roomCode);
-            console.log(`Room ${roomCode} deleted because host disconnected.`);
+            clearHostDisconnectTimer(roomCode);
+            hostDisconnectTimers.set(
+              roomCode,
+              setTimeout(
+                () => finalizeAndDeleteRoom(roomCode, "Host did not reconnect in time. Pairing terminated."),
+                HOST_RECONNECT_GRACE_MS
+              )
+            );
+            console.log(`Host of room ${roomCode} disconnected; grace timer started.`);
           } else {
             // Client left - remove client from array and notify
             room.clientSocketIds = room.clientSocketIds.filter(id => id !== socket.id);
@@ -1595,6 +1708,7 @@ function streamState(screenshotBase64: string, transcript: string) {
       content: simText,
       timestamp: new Date().toLocaleTimeString()
     });
+    capRoomHistory(room);
 
     // Update active session records (Phase 5)
     saveOrUpdateSession(roomCode, room, false);
@@ -1661,6 +1775,15 @@ function streamState(screenshotBase64: string, transcript: string) {
     console.log(`====================================================`);
   });
 }
+
+// Keep the relay alive on stray errors rather than crashing the whole process
+// (a single bad socket payload or rejected promise shouldn't take down every room).
+process.on("unhandledRejection", (reason) => {
+  console.error("[Process] Unhandled promise rejection:", reason);
+});
+process.on("uncaughtException", (err) => {
+  console.error("[Process] Uncaught exception:", err);
+});
 
 startServer().catch((err) => {
   console.error("Critical server startup error:", err);
