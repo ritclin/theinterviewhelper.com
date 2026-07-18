@@ -1,0 +1,91 @@
+name: Build client downloads
+
+on:
+  push:
+    branches: [main, "cursor/**"]
+  workflow_dispatch:
+
+jobs:
+  build-windows-exe:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies and PyInstaller
+        working-directory: windows-client
+        run: |
+          pip install -r requirements.txt -r requirements-build.txt
+
+      - name: Build stealth Windows executable
+        working-directory: windows-client
+        run: |
+          pyinstaller --noconsole --onefile --name InterviewHelperCapture `
+            --hidden-import=engineio.async_drivers.threading `
+            --hidden-import=pystray._win32 `
+            --version-file=version-info.txt `
+            client.py
+
+      - name: Upload Windows exe artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: InterviewHelperCapture-exe
+          path: windows-client/dist/InterviewHelperCapture.exe
+
+      - name: Package Windows download zip
+        run: |
+          New-Item -ItemType Directory -Force -Path public/downloads
+          Copy-Item windows-client/dist/InterviewHelperCapture.exe public/downloads/InterviewHelperCapture.exe
+          Copy-Item windows-client/INSTALL.bat public/downloads/INSTALL.bat
+          Copy-Item windows-client/RUN-STEALTH.bat public/downloads/RUN-STEALTH.bat
+          Copy-Item windows-client/WINDOWS-DEFENDER.md public/downloads/WINDOWS-DEFENDER.md
+          Copy-Item windows-client/install.ps1 public/downloads/install.ps1
+          Compress-Archive -Path public/downloads/InterviewHelperCapture.exe,public/downloads/INSTALL.bat,public/downloads/RUN-STEALTH.bat,public/downloads/WINDOWS-DEFENDER.md,public/downloads/install.ps1 -DestinationPath public/downloads/interview-helper-windows.zip -Force
+
+      - name: Upload website downloads folder
+        uses: actions/upload-artifact@v4
+        with:
+          name: website-downloads-windows
+          path: public/downloads/
+
+  build-android-apk:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: "temurin"
+          java-version: "17"
+
+      - uses: android-actions/setup-android@v3
+
+      - name: Install mobile dependencies
+        working-directory: mobile-client
+        run: npm install
+
+      - name: Prebuild Android native project
+        working-directory: mobile-client
+        run: npx expo prebuild --platform android --no-install
+
+      - name: Build release APK (JS bundle embedded — works without Metro)
+        working-directory: mobile-client/android
+        run: ./gradlew assembleRelease --no-daemon
+
+      - name: Copy APK to public downloads
+        run: |
+          mkdir -p public/downloads
+          cp mobile-client/android/app/build/outputs/apk/release/app-release.apk public/downloads/interview-helper.apk
+
+      - name: Upload Android APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: interview-helper-apk
+          path: public/downloads/interview-helper.apk

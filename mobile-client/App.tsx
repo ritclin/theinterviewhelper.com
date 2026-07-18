@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useRef } from "react";
+import React, { useState, useEffect, useRef, useCallback } from "react";
 import {
   StyleSheet,
   Text,
@@ -8,421 +8,699 @@ import {
   ScrollView,
   ActivityIndicator,
   Clipboard,
-  Dimensions,
   Platform,
   SafeAreaView,
-  StatusBar
+  StatusBar,
+  Alert,
+  Image,
+  Switch,
 } from "react-native";
+import AsyncStorage from "@react-native-async-storage/async-storage";
+import { Audio } from "expo-av";
 import { useKeepAwake } from "expo-keep-awake";
 import { io, Socket } from "socket.io-client";
+import { InterviewProfileForm, InterviewProfile } from "./components/InterviewProfileForm";
+import { useVoiceListener } from "./hooks/useVoiceListener";
 
-// Simple custom inline SVG replacements using Unicode to keep the Expo code 100% stable without external native icon compilation requirements
-const Icons = {
-  Sparkles: () => <Text style={{ fontSize: 18, color: "#818cf8" }}>✨</Text>,
-  Code: () => <Text style={{ fontSize: 14, color: "#818cf8" }}>💻</Text>,
-  Clock: () => <Text style={{ fontSize: 12, color: "#94a3b8" }}>⏱️</Text>,
-  Check: () => <Text style={{ fontSize: 14, color: "#34d399" }}>✅</Text>,
-  Copy: () => <Text style={{ fontSize: 14, color: "#94a3b8" }}>📋</Text>,
-  Wifi: () => <Text style={{ fontSize: 14, color: "#10b981" }}>📶</Text>,
-  Lock: () => <Text style={{ fontSize: 16, color: "#f43f5e" }}>🔒</Text>
+const DEFAULT_SERVER_URL = "https://theinterviewhelpercom-production.up.railway.app";
+const STORAGE_KEYS = {
+  server: "tih_mobile_server_url",
+  email: "tih_mobile_email",
+  profile: "tih_interview_profile",
+  autoAnalyze: "tih_auto_analyze",
+  autoAnswerVoice: "tih_auto_answer_voice",
+  voiceListen: "tih_voice_listen",
 };
 
+const EMPTY_PROFILE: InterviewProfile = {
+  targetPosition: "",
+  company: "",
+  jobDescription: "",
+  userCv: "",
+  specialInstructions: "",
+};
+
+type HistoryItem = { role: string; content: string; timestamp: string };
+type SubscriptionStatus = { status: "active" | "canceled" | "none"; email: string; currentPeriodEnd: number };
+
 export default function App() {
-  // Keeps the mobile screen alive for persistent, hands-free interview guidelines
   useKeepAwake();
 
-  // Socket and Session Management
   const socketRef = useRef<Socket | null>(null);
   const scrollViewRef = useRef<ScrollView>(null);
-  
-  const [serverUrl, setServerUrl] = useState("http://localhost:3000"); // Can be replaced with your deployed Cloud Run relay URL
-  const [roomCode, setRoomCode] = useState("");
-  const [isConnected, setIsConnected] = useState(false);
-  const [isPaired, setIsPaired] = useState(false);
-  const [isConnecting, setIsConnecting] = useState(false);
+  const pendingImageRef = useRef<string | null>(null);
 
-  // Live Telemetry states
-  const [screenshotText, setScreenshotText] = useState("");
+  const [serverUrl, setServerUrl] = useState(DEFAULT_SERVER_URL);
+  const [email, setEmail] = useState("");
+  const [subscription, setSubscription] = useState<SubscriptionStatus | null>(null);
+  const [checkingSub, setCheckingSub] = useState(false);
+
+  const [profile, setProfile] = useState<InterviewProfile>(EMPTY_PROFILE);
+  const [liveTranscript, setLiveTranscript] = useState("");
+  const [autoAnalyze, setAutoAnalyze] = useState(true);
+  const [autoAnswerVoice, setAutoAnswerVoice] = useState(true);
+  const [voiceListenEnabled, setVoiceListenEnabled] = useState(true);
+
+  const [roomCode, setRoomCode] = useState("");
+  const [isSessionActive, setIsSessionActive] = useState(false);
+  const [windowsConnected, setWindowsConnected] = useState(false);
+  const [sessionPaused, setSessionPaused] = useState(false);
+  const [isConnecting, setIsConnecting] = useState(false);
+  const [connectionError, setConnectionError] = useState("");
+
+  const [activeTab, setActiveTab] = useState<"setup" | "live">("setup");
+  const [screenshotUri, setScreenshotUri] = useState<string | null>(null);
   const [screenshotName, setScreenshotName] = useState("");
-  const [speechTranscript, setSpeechTranscript] = useState("");
-  
-  // Suggestion states
+
   const [suggestionStream, setSuggestionStream] = useState("");
   const [isAiStreaming, setIsAiStreaming] = useState(false);
-  const [history, setHistory] = useState<Array<{ role: string; content: string; timestamp: string }>>([]);
-
-  // Copy success indicator
+  const [aiError, setAiError] = useState("");
+  const [history, setHistory] = useState<HistoryItem[]>([]);
   const [copiedIndex, setCopiedIndex] = useState<number | null>(null);
+  const [prefsLoaded, setPrefsLoaded] = useState(false);
 
-  useEffect(() => {
-    return () => {
-      if (socketRef.current) {
-        socketRef.current.disconnect();
-      }
-    };
+  const scrollToLatest = useCallback(() => {
+    requestAnimationFrame(() => scrollViewRef.current?.scrollToEnd({ animated: true }));
   }, []);
 
-  const handleConnectAndJoin = () => {
-    if (!roomCode || roomCode.length !== 6) {
-      alert("Please enter a valid 6-digit active room code.");
+  useEffect(() => {
+    (async () => {
+      try {
+        const [savedUrl, savedEmail, savedProfile, savedAuto, savedVoice, savedListen] = await Promise.all([
+          AsyncStorage.getItem(STORAGE_KEYS.server),
+          AsyncStorage.getItem(STORAGE_KEYS.email),
+          AsyncStorage.getItem(STORAGE_KEYS.profile),
+          AsyncStorage.getItem(STORAGE_KEYS.autoAnalyze),
+          AsyncStorage.getItem(STORAGE_KEYS.autoAnswerVoice),
+          AsyncStorage.getItem(STORAGE_KEYS.voiceListen),
+        ]);
+        if (savedUrl?.trim()) setServerUrl(savedUrl.trim());
+        if (savedEmail?.trim()) setEmail(savedEmail.trim());
+        if (savedProfile) {
+          const parsed = JSON.parse(savedProfile);
+          setProfile({ ...EMPTY_PROFILE, ...parsed });
+        }
+        if (savedAuto === "0") setAutoAnalyze(false);
+        if (savedVoice === "0") setAutoAnswerVoice(false);
+        if (savedListen === "0") setVoiceListenEnabled(false);
+      } finally {
+        setPrefsLoaded(true);
+      }
+    })();
+  }, []);
+
+  useEffect(() => {
+    if (!prefsLoaded) return;
+    AsyncStorage.multiSet([
+      [STORAGE_KEYS.server, serverUrl.trim()],
+      [STORAGE_KEYS.email, email.trim()],
+      [STORAGE_KEYS.profile, JSON.stringify(profile)],
+      [STORAGE_KEYS.autoAnalyze, autoAnalyze ? "1" : "0"],
+      [STORAGE_KEYS.autoAnswerVoice, autoAnswerVoice ? "1" : "0"],
+      [STORAGE_KEYS.voiceListen, voiceListenEnabled ? "1" : "0"],
+    ]).catch(() => {});
+  }, [serverUrl, email, profile, autoAnalyze, autoAnswerVoice, voiceListenEnabled, prefsLoaded]);
+
+  const fetchSubscription = async (targetEmail: string): Promise<SubscriptionStatus | null> => {
+    try {
+      const base = serverUrl.replace(/\/$/, "");
+      const res = await fetch(`${base}/api/stripe/status?email=${encodeURIComponent(targetEmail)}`);
+      const data = await res.json();
+      if (data.success && typeof data.status === "string") {
+        return {
+          status: data.status,
+          email: data.email || targetEmail,
+          currentPeriodEnd: data.currentPeriodEnd || 0,
+        };
+      }
+      if (typeof data.status === "string") {
+        return data as SubscriptionStatus;
+      }
+    } catch {
+      // ignore
+    }
+    return null;
+  };
+
+  const ensureSubscriptionActive = async (): Promise<boolean> => {
+    const target = email.trim().toLowerCase();
+    if (!target) {
+      Alert.alert("Email required", "Enter the same email you used for payment.");
+      return false;
+    }
+    setCheckingSub(true);
+    try {
+      const base = serverUrl.replace(/\/$/, "");
+      const syncRes = await fetch(`${base}/api/stripe/sync-subscription`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ email: target }),
+      });
+      const syncData = await syncRes.json();
+      if (syncData.success && syncData.subscription) {
+        setSubscription(syncData.subscription);
+        return true;
+      }
+
+      const sub = await fetchSubscription(target);
+      if (sub) setSubscription(sub);
+      if (sub?.status === "active") return true;
+
+      Alert.alert(
+        "Subscription required",
+        syncData.error ||
+          "No active €20/month subscription found. Subscribe on the website, then tap Refresh from Stripe.",
+        [{ text: "OK" }]
+      );
+      return false;
+    } catch {
+      Alert.alert("Error", "Could not reach billing server.");
+      return false;
+    } finally {
+      setCheckingSub(false);
+    }
+  };
+
+  const checkSubscription = async () => ensureSubscriptionActive();
+
+  const syncSubscription = async () => {
+    const target = email.trim().toLowerCase();
+    if (!target) return;
+    setCheckingSub(true);
+    try {
+      const base = serverUrl.replace(/\/$/, "");
+      const res = await fetch(`${base}/api/stripe/sync-subscription`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ email: target }),
+      });
+      const data = await res.json();
+      if (data.success && data.subscription) {
+        setSubscription(data.subscription);
+        Alert.alert("Success", "Subscription synced from Stripe.");
+      } else {
+        Alert.alert("Not found", data.error || "No active subscription for this email.");
+      }
+    } catch {
+      Alert.alert("Error", "Could not reach billing server.");
+    } finally {
+      setCheckingSub(false);
+    }
+  };
+
+  const openSubscribePage = () => {
+    const base = serverUrl.replace(/\/$/, "");
+    Alert.alert("Subscribe", `Open ${base} in your browser and tap Subscribe (€20/month).`);
+  };
+
+  const teardownSocket = useCallback(() => {
+    const socket = socketRef.current;
+    if (!socket) return;
+    socket.removeAllListeners();
+    socket.disconnect();
+    socketRef.current = null;
+  }, []);
+
+  useEffect(() => () => teardownSocket(), [teardownSocket]);
+
+  const requestAiAssist = useCallback(
+    (image?: string | null, transcript?: string) => {
+      if (sessionPaused) return;
+      const socket = socketRef.current;
+      if (!socket?.connected) return;
+      if (!profile.targetPosition.trim()) {
+        Alert.alert("Profile required", "Set your target position before requesting AI answers.");
+        setActiveTab("setup");
+        return;
+      }
+      socket.emit("request-ai-assist", {
+        image: image || undefined,
+        audioTranscript: transcript || liveTranscript || undefined,
+        interviewProfile: profile,
+        prompt: "Provide a STAR-format interview answer tailored to this candidate. For coding questions include strategy and code.",
+        timestamp: Date.now(),
+      });
+    },
+    [profile, liveTranscript, sessionPaused]
+  );
+
+  const handleVoiceTranscript = useCallback(
+    (text: string) => {
+      setLiveTranscript(text);
+      if (autoAnswerVoice && isSessionActive && windowsConnected && !sessionPaused) {
+        requestAiAssist(pendingImageRef.current, text);
+      }
+    },
+    [autoAnswerVoice, isSessionActive, windowsConnected, sessionPaused, requestAiAssist]
+  );
+
+  const { isListening } = useVoiceListener({
+    enabled:
+      isSessionActive &&
+      windowsConnected &&
+      voiceListenEnabled &&
+      !sessionPaused &&
+      Boolean(email.trim()) &&
+      Boolean(roomCode),
+    email,
+    roomCode,
+    serverUrl,
+    onTranscript: handleVoiceTranscript,
+    onError: (msg) => setAiError(msg),
+  });
+
+  const registerSocketListeners = useCallback(
+    (socket: Socket) => {
+      socket.on("connect", () => {
+        setConnectionError("");
+        socket.emit("create-room", { email: email.trim().toLowerCase() }, (response: any) => {
+          setIsConnecting(false);
+          if (response?.success) {
+            setRoomCode(response.roomCode);
+            setIsSessionActive(true);
+            setWindowsConnected(false);
+            setSessionPaused(false);
+            setActiveTab("setup");
+            setHistory([]);
+            setSuggestionStream("");
+            setAiError("");
+          } else {
+            const msg = response?.error || "Could not start session.";
+            setConnectionError(msg);
+            if (response?.code === "SUBSCRIPTION_REQUIRED") {
+              Alert.alert("Subscription required", msg, [
+                { text: "Refresh", onPress: syncSubscription },
+                { text: "OK" },
+              ]);
+            } else {
+              Alert.alert("Session failed", msg);
+            }
+            teardownSocket();
+          }
+        });
+      });
+
+      socket.on("disconnect", () => {
+        setIsSessionActive(false);
+        setWindowsConnected(false);
+        setIsConnecting(false);
+        setIsAiStreaming(false);
+      });
+
+      socket.on("paired", (data: { clientsCount?: number; roomCode?: string }) => {
+        if ((data?.clientsCount || 0) >= 1) {
+          setWindowsConnected(true);
+          setSessionPaused(false);
+          setActiveTab("live");
+          setVoiceListenEnabled(true);
+          setAutoAnswerVoice(true);
+          setAiError("");
+        }
+      });
+
+      socket.on("connect_error", (err: Error) => {
+        setIsConnecting(false);
+        setConnectionError(err.message || "Connection failed.");
+      });
+
+      socket.on("stream-feed", (payload: { image?: string; imageName?: string; imageText?: string; audioTranscript?: string }) => {
+        if (sessionPaused) return;
+        if (payload.imageName) setScreenshotName(payload.imageName);
+        if (payload.audioTranscript) {
+          setLiveTranscript(payload.audioTranscript);
+          if (autoAnswerVoice && !payload.image) {
+            requestAiAssist(null, payload.audioTranscript);
+          }
+        }
+        if (payload.image) {
+          setScreenshotUri(payload.image);
+          pendingImageRef.current = payload.image;
+          if (autoAnalyze) {
+            requestAiAssist(payload.image, payload.audioTranscript || liveTranscript);
+          }
+        }
+      });
+
+      socket.on("ai-start", () => {
+        setIsAiStreaming(true);
+        setAiError("");
+        setSuggestionStream("");
+      });
+
+      socket.on("ai-chunk", (data: { text?: string }) => {
+        setIsAiStreaming(false);
+        setSuggestionStream((prev) => prev + (data.text || ""));
+      });
+
+      socket.on("ai-end", (data: { fullText?: string }) => {
+        setIsAiStreaming(false);
+        const fullText = data.fullText || "";
+        if (fullText.trim()) {
+          setHistory((prev) => [
+            ...prev,
+            { role: "assistant", content: fullText, timestamp: new Date().toLocaleTimeString() },
+          ]);
+        }
+        setSuggestionStream("");
+      });
+
+      socket.on("ai-error", (data: { error?: string; code?: string }) => {
+        setIsAiStreaming(false);
+        setSuggestionStream("");
+        setAiError(data.error || "AI failed.");
+        if (data.code === "SUBSCRIPTION_REQUIRED") {
+          Alert.alert("Subscription expired", data.error || "Renew at /subscribe");
+        }
+      });
+
+      socket.on("room-expired", () => {
+        Alert.alert("Session expired", "Start a new session.");
+        endSession();
+      });
+    },
+    [email, autoAnalyze, autoAnswerVoice, liveTranscript, requestAiAssist, teardownSocket, sessionPaused]
+  );
+
+  const startSession = async () => {
+    if (!(await ensureSubscriptionActive())) return;
+    if (!profile.targetPosition.trim()) {
+      Alert.alert("Profile", "Enter the position you are interviewing for.");
+      setActiveTab("setup");
       return;
     }
 
+    const mic = await Audio.requestPermissionsAsync();
+    if (!mic.granted) {
+      Alert.alert(
+        "Microphone required",
+        "Allow microphone access so the phone can hear interview questions from your laptop speakers."
+      );
+      return;
+    }
+
+    teardownSocket();
     setIsConnecting(true);
-    
-    // Initialize Socket Connection with wide fallback support
-    const socket = io(serverUrl, {
+    setConnectionError("");
+
+    const socket = io(serverUrl.replace(/\/$/, ""), {
       transports: ["websocket", "polling"],
-      reconnectionAttempts: 5,
-      reconnectionDelay: 1000
+      reconnectionAttempts: 8,
+      timeout: 15000,
     });
-
     socketRef.current = socket;
-
-    socket.on("connect", () => {
-      setIsConnected(true);
-      console.log("Connected to Relay Server:", socket.id);
-      
-      // Submit pairing code
-      socket.emit("join-room", { roomCode }, (response: any) => {
-        setIsConnecting(false);
-        if (response.success) {
-          setIsPaired(true);
-          setHistory(response.history || []);
-          setScreenshotText("");
-          setSpeechTranscript("");
-          setScreenshotName("");
-        } else {
-          alert(`Pairing Failed: ${response.error}`);
-          socket.disconnect();
-        }
-      });
-    });
-
-    socket.on("disconnect", () => {
-      setIsConnected(false);
-      setIsPaired(false);
-      setIsConnecting(false);
-    });
-
-    // Handle universal casting signals
-    socket.on("paired", (data) => {
-      console.log("Room paired confirmation received.");
-      setIsPaired(true);
-    });
-
-    socket.on("stream-feed", (payload) => {
-      if (payload.imageText) setScreenshotText(payload.imageText);
-      if (payload.imageName) setScreenshotName(payload.imageName);
-      if (payload.audioTranscript) setSpeechTranscript(payload.audioTranscript);
-    });
-
-    socket.on("ai-start", () => {
-      setIsAiStreaming(true);
-      setSuggestionStream("");
-    });
-
-    socket.on("ai-chunk", (data) => {
-      setIsAiStreaming(false);
-      setSuggestionStream((prev) => prev + data.text);
-      // Automatically scroll to bottom of suggestions for seamless hands-free scanning
-      if (scrollViewRef.current) {
-        scrollViewRef.current.scrollToEnd({ animated: true });
-      }
-    });
-
-    socket.on("ai-end", (data) => {
-      setIsAiStreaming(false);
-      setHistory((prev) => [
-        ...prev,
-        {
-          role: "assistant",
-          content: data.fullText,
-          timestamp: new Date().toLocaleTimeString()
-        }
-      ]);
-      setSuggestionStream("");
-    });
-
-    socket.on("room-closed", () => {
-      alert("Host client disconnected. Pairing ended.");
-      handleDisconnect();
-    });
-
-    socket.on("room-expired", () => {
-      alert("This room session has expired.");
-      handleDisconnect();
-    });
+    registerSocketListeners(socket);
   };
 
-  const handleDisconnect = () => {
-    if (socketRef.current) {
-      socketRef.current.disconnect();
-    }
-    setIsPaired(false);
-    setIsConnected(false);
+  const endSession = () => {
+    teardownSocket();
+    setIsSessionActive(false);
+    setWindowsConnected(false);
+    setSessionPaused(false);
+    setRoomCode("");
+    setScreenshotUri(null);
     setSuggestionStream("");
     setHistory([]);
-    setScreenshotText("");
-    setSpeechTranscript("");
+    setAiError("");
   };
 
-  const handleCopyToClipboard = (text: string, index: number) => {
+  useEffect(() => {
+    scrollToLatest();
+  }, [suggestionStream, history, scrollToLatest]);
+
+  const handleCopy = (text: string, index: number) => {
     Clipboard.setString(text);
     setCopiedIndex(index);
     setTimeout(() => setCopiedIndex(null), 2000);
   };
 
-  // High-performance streaming markdown rendering engine tailored for mobile layouts
-  const renderMarkdownBlocks = (markdownText: string) => {
-    const blocks: any[] = [];
-    let currentIndex = 0;
-
-    while (true) {
-      const startIndex = markdownText.indexOf("```", currentIndex);
-      if (startIndex === -1) {
-        if (currentIndex < markdownText.length) {
-          blocks.push({ type: "text", value: markdownText.substring(currentIndex) });
-        }
+  const renderMarkdown = (markdownText: string, prefix: string) => {
+    const blocks: Array<{ type: string; value: string; language?: string }> = [];
+    let idx = 0;
+    while (idx < markdownText.length) {
+      const start = markdownText.indexOf("```", idx);
+      if (start === -1) {
+        blocks.push({ type: "text", value: markdownText.slice(idx) });
         break;
       }
-
-      if (startIndex > currentIndex) {
-        blocks.push({ type: "text", value: markdownText.substring(currentIndex, startIndex) });
-      }
-
-      const endIndex = markdownText.indexOf("```", startIndex + 3);
-      if (endIndex === -1) {
-        // Safe open block segment during live server streaming
-        const blockContent = markdownText.substring(startIndex + 3);
-        const newlineIdx = blockContent.indexOf("\n");
-        const lang = newlineIdx !== -1 ? blockContent.substring(0, newlineIdx).trim() : "";
-        const code = newlineIdx !== -1 ? blockContent.substring(newlineIdx + 1) : blockContent;
-        blocks.push({ type: "code", language: lang, value: code, isIncomplete: true });
+      if (start > idx) blocks.push({ type: "text", value: markdownText.slice(idx, start) });
+      const end = markdownText.indexOf("```", start + 3);
+      if (end === -1) {
+        blocks.push({ type: "code", value: markdownText.slice(start + 3), language: "" });
         break;
-      } else {
-        const blockContent = markdownText.substring(startIndex + 3, endIndex);
-        const newlineIdx = blockContent.indexOf("\n");
-        const lang = newlineIdx !== -1 ? blockContent.substring(0, newlineIdx).trim() : "";
-        const code = newlineIdx !== -1 ? blockContent.substring(newlineIdx + 1) : blockContent;
-        blocks.push({ type: "code", language: lang, value: code, isIncomplete: false });
-        currentIndex = endIndex + 3;
       }
+      const inner = markdownText.slice(start + 3, end);
+      const nl = inner.indexOf("\n");
+      const lang = nl >= 0 ? inner.slice(0, nl).trim() : "";
+      const code = nl >= 0 ? inner.slice(nl + 1) : inner;
+      blocks.push({ type: "code", value: code, language: lang });
+      idx = end + 3;
     }
 
-    return blocks.map((block, idx) => {
+    return blocks.map((block, bi) => {
+      const key = `${prefix}-${bi}`;
       if (block.type === "code") {
         return (
-          <View key={idx} style={styles.codeContainer}>
+          <View key={key} style={styles.codeBox}>
             <View style={styles.codeHeader}>
-              <View style={styles.row}>
-                <Icons.Code />
-                <Text style={styles.codeHeaderText}>
-                  {block.language.toUpperCase() || "CODE"} {block.isIncomplete && "(streaming)"}
-                </Text>
-              </View>
-              <TouchableOpacity 
-                onPress={() => handleCopyToClipboard(block.value, idx)}
-                style={styles.copyBtn}
-              >
-                {copiedIndex === idx ? <Icons.Check /> : <Icons.Copy />}
+              <Text style={styles.codeLang}>{block.language?.toUpperCase() || "CODE"}</Text>
+              <TouchableOpacity onPress={() => handleCopy(block.value, bi)}>
+                <Text style={styles.copyText}>{copiedIndex === bi ? "Copied" : "Copy"}</Text>
               </TouchableOpacity>
             </View>
-            <ScrollView horizontal showsHorizontalScrollIndicator={false} style={styles.codeScroll}>
+            <ScrollView horizontal>
               <Text style={styles.codeText}>{block.value}</Text>
             </ScrollView>
           </View>
         );
-      } else {
-        const lines = block.value.split("\n");
-        return lines.map((line: string, lineIdx: number) => {
-          const trimmed = line.trim();
-          if (!trimmed) return <View key={`${idx}-${lineIdx}`} style={{ height: 6 }} />;
-
-          // Header structures
-          if (trimmed.startsWith("### ")) {
-            return (
-              <View key={`${idx}-${lineIdx}`} style={styles.header3Container}>
-                <View style={styles.headerDot} />
-                <Text style={styles.header3Text}>{trimmed.replace("### ", "")}</Text>
-              </View>
-            );
-          }
-          if (trimmed.startsWith("## ")) {
-            return (
-              <Text key={`${idx}-${lineIdx}`} style={styles.header2Text}>
-                {trimmed.replace("## ", "")}
-              </Text>
-            );
-          }
-
-          // Bullet points
-          if (trimmed.startsWith("* ") || trimmed.startsWith("- ")) {
-            return (
-              <View key={`${idx}-${lineIdx}`} style={styles.bulletRow}>
-                <Text style={styles.bulletDot}>•</Text>
-                <Text style={styles.bulletText}>{trimmed.substring(2)}</Text>
-              </View>
-            );
-          }
-
+      }
+      return block.value.split("\n").map((line, li) => {
+        const t = line.trim();
+        if (!t) return <View key={`${key}-${li}`} style={{ height: 6 }} />;
+        if (t.startsWith("### ") || t.startsWith("⭐"))
           return (
-            <Text key={`${idx}-${lineIdx}`} style={styles.bodyText}>
-              {line}
+            <Text key={`${key}-${li}`} style={styles.h3}>
+              {t.replace(/^###\s*/, "")}
             </Text>
           );
-        });
-      }
+        if (t.startsWith("**Situation") || t.startsWith("**Task") || t.startsWith("**Action") || t.startsWith("**Result"))
+          return (
+            <Text key={`${key}-${li}`} style={styles.starLine}>
+              {t.replace(/\*\*/g, "")}
+            </Text>
+          );
+        if (t.startsWith("* ") || t.startsWith("- "))
+          return (
+            <Text key={`${key}-${li}`} style={styles.bullet}>
+              • {t.slice(2)}
+            </Text>
+          );
+        return (
+          <Text key={`${key}-${li}`} style={styles.body}>
+            {line}
+          </Text>
+        );
+      });
+    });
+  };
+
+  const subActive = subscription?.status === "active";
+
+  const toggleSessionPause = () => {
+    setSessionPaused((prev) => {
+      const next = !prev;
+      if (!next) setAiError("");
+      return next;
     });
   };
 
   return (
-    <SafeAreaView style={styles.safeArea}>
+    <SafeAreaView style={styles.safe}>
       <StatusBar barStyle="light-content" backgroundColor="#020617" />
-      
-      {/* Header Bar */}
-      <View style={styles.headerBar}>
-        <View style={styles.row}>
-          <View style={styles.logoBadge}>
-            <Text style={styles.logoEmoji}>✨</Text>
-          </View>
-          <View>
-            <Text style={styles.logoTitle}>TheInterviewHelper</Text>
-            <Text style={styles.logoSubtitle}>Companion App - Sub-2s Latency</Text>
-          </View>
+
+      <View style={styles.header}>
+        <View>
+          <Text style={styles.headerTitle}>Interview Helper</Text>
+          <Text style={styles.headerSub}>
+            {isSessionActive
+              ? windowsConnected
+                ? sessionPaused
+                  ? `Room ${roomCode} · Paused`
+                  : `Room ${roomCode} · Live`
+                : `Room ${roomCode} · Waiting for Windows`
+              : subActive
+                ? "Ready to start"
+                : "Subscribe to pair"}
+          </Text>
         </View>
-        
-        {isPaired && (
-          <TouchableOpacity onPress={handleDisconnect} style={styles.disconnectBadge}>
-            <Text style={styles.disconnectBadgeText}>Unpair</Text>
+        {isSessionActive && (
+          <TouchableOpacity onPress={endSession} style={styles.endBtn}>
+            <Text style={styles.endBtnText}>End</Text>
           </TouchableOpacity>
         )}
       </View>
 
-      {/* PAIRING SETUP VIEW */}
-      {!isPaired ? (
-        <ScrollView contentContainerStyle={styles.pairingContainer} keyboardShouldPersistTaps="handled">
-          <View style={styles.pairingCard}>
-            <Text style={styles.pairingEmoji}>📱</Text>
-            <Text style={styles.pairingTitle}>Connect Companion Device</Text>
-            <Text style={styles.pairingSubtitle}>
-              Link your mobile screen instantly to cast suggestions hands-free during active technical rounds.
-            </Text>
+      <View style={styles.tabs}>
+        <TouchableOpacity onPress={() => setActiveTab("setup")} style={[styles.tab, activeTab === "setup" && styles.tabActive]}>
+          <Text style={styles.tabText}>Setup</Text>
+        </TouchableOpacity>
+        <TouchableOpacity
+          onPress={() => setActiveTab("live")}
+          style={[styles.tab, activeTab === "live" && styles.tabActive]}
+          disabled={!isSessionActive || !windowsConnected}
+        >
+          <Text style={[styles.tabText, (!isSessionActive || !windowsConnected) && styles.tabDisabled]}>Live answers</Text>
+        </TouchableOpacity>
+      </View>
 
-            <View style={styles.inputGroup}>
-              <Text style={styles.inputLabel}>RELAY SERVER URL</Text>
-              <TextInput
-                value={serverUrl}
-                onChangeText={setServerUrl}
-                style={styles.inputField}
-                placeholder="e.g. http://192.168.1.100:3000"
-                placeholderTextColor="#475569"
-                autoCapitalize="none"
-                autoCorrect={false}
-              />
-            </View>
+      {activeTab === "setup" ? (
+        <ScrollView contentContainerStyle={styles.setupPad} keyboardShouldPersistTaps="handled">
+          <Text style={styles.sectionLabel}>BILLING EMAIL (same as payment)</Text>
+          <TextInput
+            style={styles.input}
+            value={email}
+            onChangeText={setEmail}
+            placeholder="you@email.com"
+            placeholderTextColor="#475569"
+            autoCapitalize="none"
+            keyboardType="email-address"
+          />
+          <View style={styles.row}>
+            <TouchableOpacity onPress={checkSubscription} style={styles.secondaryBtn} disabled={checkingSub}>
+              <Text style={styles.secondaryBtnText}>{checkingSub ? "…" : "Check subscription"}</Text>
+            </TouchableOpacity>
+            <TouchableOpacity onPress={syncSubscription} style={styles.secondaryBtn} disabled={checkingSub}>
+              <Text style={styles.secondaryBtnText}>Refresh from Stripe</Text>
+            </TouchableOpacity>
+          </View>
+          {!subActive && (
+            <TouchableOpacity onPress={openSubscribePage} style={styles.subscribeBtn}>
+              <Text style={styles.subscribeBtnText}>Subscribe — €20/month</Text>
+            </TouchableOpacity>
+          )}
+          {subActive && (
+            <Text style={styles.activeBadge}>✓ Subscription active for {subscription?.email}</Text>
+          )}
 
-            <View style={styles.inputGroup}>
-              <Text style={styles.inputLabel}>6-DIGIT PAIRING CODE</Text>
-              <TextInput
-                value={roomCode}
-                onChangeText={(val) => setRoomCode(val.replace(/\D/g, ""))}
-                maxLength={6}
-                keyboardType="number-pad"
-                style={styles.codeInputField}
-                placeholder="e.g. 512039"
-                placeholderTextColor="#334155"
-              />
-            </View>
+          <InterviewProfileForm
+            profile={profile}
+            onChange={setProfile}
+            liveTranscript={liveTranscript}
+            onLiveTranscriptChange={setLiveTranscript}
+          />
 
-            <TouchableOpacity 
-              onPress={handleConnectAndJoin} 
-              style={styles.pairButton}
-              disabled={isConnecting}
+          <View style={styles.autoRow}>
+            <Text style={styles.autoLabel}>Auto-analyze when Windows sends screenshot</Text>
+            <Switch value={autoAnalyze} onValueChange={setAutoAnalyze} trackColor={{ true: "#4f46e5" }} />
+          </View>
+          <View style={styles.autoRow}>
+            <Text style={styles.autoLabel}>Listen to interview voice (keep phone near laptop)</Text>
+            <Switch value={voiceListenEnabled} onValueChange={setVoiceListenEnabled} trackColor={{ true: "#4f46e5" }} />
+          </View>
+          <View style={styles.autoRow}>
+            <Text style={styles.autoLabel}>Auto-answer when voice question detected</Text>
+            <Switch value={autoAnswerVoice} onValueChange={setAutoAnswerVoice} trackColor={{ true: "#4f46e5" }} />
+          </View>
+
+          {!isSessionActive ? (
+            <TouchableOpacity
+              onPress={startSession}
+              style={[styles.primaryBtn, (!subActive || isConnecting) && styles.primaryBtnDisabled]}
+              disabled={!subActive || isConnecting}
             >
               {isConnecting ? (
                 <ActivityIndicator color="#fff" />
               ) : (
-                <Text style={styles.pairButtonText}>Link Session</Text>
+                <Text style={styles.primaryBtnText}>Start pairing session</Text>
               )}
             </TouchableOpacity>
-          </View>
-
-          <View style={styles.specCard}>
-            <Icons.Lock />
-            <Text style={styles.specTitle}>Secure Local Pipeline</Text>
-            <Text style={styles.specDesc}>
-              This mobile connection establishes high-performance websocket sync channels with zero diagnostic storage footprint.
-            </Text>
-          </View>
+          ) : (
+            <View style={styles.roomCard}>
+              <Text style={styles.roomLabel}>WINDOWS CLIENT ROOM CODE</Text>
+              <Text style={styles.roomCode}>{roomCode}</Text>
+              <Text style={styles.roomHint}>
+                {windowsConnected
+                  ? "Windows is connected. Open the Live answers tab — voice listening and AI answers start automatically."
+                  : "Waiting for Windows… Run INSTALL.bat on your PC with this code. Live answers open automatically once connected."}
+              </Text>
+              {windowsConnected ? (
+                <TouchableOpacity onPress={() => setActiveTab("live")} style={styles.openLiveBtn}>
+                  <Text style={styles.openLiveBtnText}>Open Live answers</Text>
+                </TouchableOpacity>
+              ) : null}
+            </View>
+          )}
+          {connectionError ? <Text style={styles.error}>{connectionError}</Text> : null}
         </ScrollView>
       ) : (
-        // ACTIVE INTERVIEW GUIDE PANEL
-        <View style={styles.activeContainer}>
-          
-          {/* Incoming Screen & Transcript Mirror Sub-Feed */}
-          <View style={styles.telemetryBar}>
-            <View style={[styles.telemetryCard, { marginRight: 8 }]}>
-              <Text style={styles.telemetryLabel}>SCREENSHOT CAPTURE</Text>
-              <Text style={styles.telemetryValue} numberOfLines={1}>
-                {screenshotName ? `📷 ${screenshotName}` : "Awaiting screen frame..."}
+        <View style={styles.liveWrap}>
+          <View style={styles.liveStatusBar}>
+            <View style={{ flex: 1 }}>
+              <Text style={styles.liveStatusText}>
+                {sessionPaused
+                  ? "⏸ Paused — tap Resume to listen & answer again"
+                  : isListening
+                    ? "🎙️ Listening to interview…"
+                    : voiceListenEnabled
+                      ? "Starting microphone…"
+                      : "Voice listen off"}
+              </Text>
+              <Text style={styles.liveStatusSub}>
+                Room {roomCode} · Windows: Ctrl+Shift+Space for coding screens
               </Text>
             </View>
-            <View style={styles.telemetryCard}>
-              <Text style={styles.telemetryLabel}>SPEECH INPUT</Text>
-              <Text style={styles.telemetryValue} numberOfLines={1}>
-                {speechTranscript ? `🎙️ "${speechTranscript}"` : "Awaiting interviewer voice..."}
-              </Text>
-            </View>
+            <TouchableOpacity
+              onPress={toggleSessionPause}
+              style={[styles.pauseBtn, sessionPaused && styles.pauseBtnActive]}
+            >
+              <Text style={styles.pauseBtnText}>{sessionPaused ? "▶ Resume" : "⏸ Pause"}</Text>
+            </TouchableOpacity>
           </View>
+          {sessionPaused ? (
+            <View style={styles.pausedBanner}>
+              <Text style={styles.pausedBannerText}>
+                AI answers and voice listening are paused. Tap Resume when the interview continues.
+              </Text>
+            </View>
+          ) : null}
+          {liveTranscript ? (
+            <View style={styles.transcriptBar}>
+              <Text style={styles.transcriptLabel}>Heard:</Text>
+              <Text style={styles.transcriptText} numberOfLines={2}>{liveTranscript}</Text>
+            </View>
+          ) : null}
+          {screenshotUri ? (
+            <View style={styles.shotWrap}>
+              <Text style={styles.shotLabel}>Latest capture {screenshotName ? `· ${screenshotName}` : ""}</Text>
+              <Image source={{ uri: screenshotUri }} style={styles.shotImage} resizeMode="contain" />
+              <TouchableOpacity
+                style={styles.analyzeBtn}
+                onPress={() => requestAiAssist(pendingImageRef.current, liveTranscript)}
+              >
+                <Text style={styles.analyzeBtnText}>Analyze screen with AI</Text>
+              </TouchableOpacity>
+            </View>
+          ) : (
+            <Text style={styles.waitShot}>Waiting for Windows screenshot (Ctrl+Shift+Space on PC)…</Text>
+          )}
 
-          {/* Core Streaming Suggestions Frame */}
-          <ScrollView
-            ref={scrollViewRef}
-            contentContainerStyle={styles.suggestionContent}
-            style={styles.suggestionScrollView}
-          >
-            {isAiStreaming && (
-              <View style={styles.loaderContainer}>
-                <ActivityIndicator size="large" color="#6366f1" />
-                <Text style={styles.loaderText}>SYNTESIZING RESPONSES...</Text>
-                <Text style={styles.loaderSub}>Optimizing time & space bounds...</Text>
+          <ScrollView ref={scrollViewRef} style={styles.answerScroll} contentContainerStyle={styles.answerPad}>
+            {isAiStreaming && !suggestionStream && (
+              <View style={styles.loading}>
+                <ActivityIndicator color="#6366f1" size="large" />
+                <Text style={styles.loadingText}>Generating personalized answer…</Text>
               </View>
             )}
-
-            {!isAiStreaming && !suggestionStream && history.length === 0 && (
-              <View style={styles.emptyContainer}>
-                <Icons.Sparkles />
-                <Text style={styles.emptyTitle}>Ready for Live Rounds</Text>
-                <Text style={styles.emptySubtitle}>
-                  Trigger suggestions from your desktop capture client. Real-time cheat sheets will stream here instantly.
-                </Text>
+            {aiError ? <Text style={styles.error}>{aiError}</Text> : null}
+            {history.map((item, i) => (
+              <View key={`h-${i}`} style={styles.answerCard}>
+                <Text style={styles.answerMeta}>Answer #{i + 1} · {item.timestamp}</Text>
+                {renderMarkdown(item.content, `h${i}`)}
               </View>
-            )}
-
-            {/* Currently streaming suggestions */}
+            ))}
             {suggestionStream ? (
-              <View>
-                <View style={styles.activeStreamBadge}>
-                  <Icons.Sparkles />
-                  <Text style={styles.activeStreamBadgeText}>OPTIMIZATION FLOW STREAMING</Text>
-                </View>
-                {renderMarkdownBlocks(suggestionStream)}
-              </View>
-            ) : null}
-
-            {/* Render suggestion logs/history */}
-            {!suggestionStream && history.length > 0 ? (
-              <View>
-                {history.map((item, index) => (
-                  <View key={index} style={styles.historyBlock}>
-                    <View style={styles.historyMetaRow}>
-                      <Text style={styles.historyMetaText}>SUGGESTION CARD #{index + 1}</Text>
-                      <Text style={styles.historyMetaText}>{item.timestamp}</Text>
-                    </View>
-                    {renderMarkdownBlocks(item.content)}
-                  </View>
-                ))}
+              <View style={styles.answerCard}>
+                <Text style={styles.answerMeta}>Streaming…</Text>
+                {renderMarkdown(suggestionStream, "stream")}
               </View>
             ) : null}
           </ScrollView>
@@ -433,367 +711,163 @@ export default function App() {
 }
 
 const styles = StyleSheet.create({
-  safeArea: {
-    flex: 1,
-    backgroundColor: "#020617"
-  },
-  row: {
+  safe: { flex: 1, backgroundColor: "#020617" },
+  header: {
     flexDirection: "row",
-    alignItems: "center"
-  },
-  headerBar: {
-    height: 60,
-    backgroundColor: "#090d16",
-    borderBottomWidth: 1,
-    borderColor: "#1e293b",
-    flexDirection: "row",
+    justifyContent: "space-between",
     alignItems: "center",
-    justifyContent: "between",
-    paddingHorizontal: 16
-  },
-  logoBadge: {
-    width: 32,
-    height: 32,
-    borderRadius: 8,
-    backgroundColor: "#1e1b4b",
-    alignItems: "center",
-    justifyContent: "center",
-    marginRight: 10
-  },
-  logoEmoji: {
-    fontSize: 16
-  },
-  logoTitle: {
-    fontFamily: Platform.OS === "ios" ? "Helvetica Neue" : "sans-serif-condensed",
-    fontWeight: "bold",
-    fontSize: 14,
-    color: "#fff"
-  },
-  logoSubtitle: {
-    fontSize: 9,
-    color: "#475569"
-  },
-  disconnectBadge: {
-    paddingHorizontal: 12,
-    paddingVertical: 6,
-    borderRadius: 6,
-    backgroundColor: "#1e293b"
-  },
-  disconnectBadgeText: {
-    color: "#ef4444",
-    fontSize: 11,
-    fontWeight: "bold"
-  },
-  pairingContainer: {
-    padding: 20,
-    alignItems: "center",
-    justifyContent: "center",
-    flexGrow: 1
-  },
-  pairingCard: {
-    width: "100%",
-    maxWidth: 380,
-    backgroundColor: "#0b1329",
-    borderRadius: 16,
-    padding: 24,
-    borderWidth: 1,
-    borderColor: "#1e293b",
-    alignItems: "center",
-    shadowColor: "#6366f1",
-    shadowOffset: { width: 0, height: 8 },
-    shadowOpacity: 0.1,
-    shadowRadius: 24,
-    elevation: 8
-  },
-  pairingEmoji: {
-    fontSize: 42,
-    marginBottom: 12
-  },
-  pairingTitle: {
-    fontSize: 18,
-    fontWeight: "bold",
-    color: "#f8fafc",
-    marginBottom: 6,
-    textAlign: "center"
-  },
-  pairingSubtitle: {
-    fontSize: 12,
-    color: "#64748b",
-    textAlign: "center",
-    lineHeight: 18,
-    marginBottom: 24
-  },
-  inputGroup: {
-    width: "100%",
-    marginBottom: 16
-  },
-  inputLabel: {
-    fontSize: 9,
-    fontWeight: "bold",
-    color: "#6366f1",
-    letterSpacing: 1.5,
-    marginBottom: 6
-  },
-  inputField: {
-    backgroundColor: "#020617",
-    borderWidth: 1,
-    borderColor: "#1e293b",
-    borderRadius: 8,
-    paddingHorizontal: 12,
-    paddingVertical: 10,
-    color: "#f8fafc",
-    fontSize: 13
-  },
-  codeInputField: {
-    backgroundColor: "#020617",
-    borderWidth: 1,
-    borderColor: "#334155",
-    borderRadius: 8,
-    paddingHorizontal: 12,
+    paddingHorizontal: 16,
     paddingVertical: 12,
-    color: "#818cf8",
-    fontSize: 22,
-    fontWeight: "bold",
-    textAlign: "center",
-    letterSpacing: 4
-  },
-  pairButton: {
-    width: "100%",
-    backgroundColor: "#4f46e5",
-    borderRadius: 10,
-    paddingVertical: 14,
-    alignItems: "center",
-    marginTop: 10,
-    shadowColor: "#4f46e5",
-    shadowOffset: { width: 0, height: 4 },
-    shadowOpacity: 0.3,
-    shadowRadius: 12,
-    elevation: 4
-  },
-  pairButtonText: {
-    color: "#fff",
-    fontSize: 13,
-    fontWeight: "bold"
-  },
-  specCard: {
-    marginTop: 24,
-    maxWidth: 380,
-    backgroundColor: "#090d16",
-    borderRadius: 12,
-    borderWidth: 1,
-    borderColor: "#111827",
-    padding: 16,
-    flexDirection: "row",
-    alignItems: "center"
-  },
-  specTitle: {
-    color: "#f8fafc",
-    fontSize: 12,
-    fontWeight: "bold",
-    marginLeft: 12,
-    marginRight: 4
-  },
-  specDesc: {
-    color: "#475569",
-    fontSize: 10,
-    flex: 1,
-    marginLeft: 12,
-    lineHeight: 14
-  },
-  activeContainer: {
-    flex: 1
-  },
-  telemetryBar: {
-    flexDirection: "row",
-    padding: 12,
-    backgroundColor: "#090d16",
     borderBottomWidth: 1,
-    borderColor: "#1e293b"
+    borderColor: "#1e293b",
   },
-  telemetryCard: {
-    flex: 1,
-    backgroundColor: "#020617",
+  headerTitle: { color: "#fff", fontSize: 16, fontWeight: "bold" },
+  headerSub: { color: "#64748b", fontSize: 10, marginTop: 2 },
+  endBtn: { backgroundColor: "#1e293b", paddingHorizontal: 12, paddingVertical: 6, borderRadius: 6 },
+  endBtnText: { color: "#f87171", fontSize: 11, fontWeight: "bold" },
+  tabs: { flexDirection: "row", borderBottomWidth: 1, borderColor: "#1e293b" },
+  tab: { flex: 1, paddingVertical: 10, alignItems: "center" },
+  tabActive: { borderBottomWidth: 2, borderBottomColor: "#6366f1" },
+  tabText: { color: "#94a3b8", fontSize: 12, fontWeight: "600" },
+  tabDisabled: { opacity: 0.4 },
+  setupPad: { padding: 16, paddingBottom: 40 },
+  sectionLabel: { color: "#6366f1", fontSize: 9, fontWeight: "bold", letterSpacing: 1.2, marginBottom: 6 },
+  input: {
+    backgroundColor: "#0f172a",
     borderWidth: 1,
-    borderColor: "#111827",
+    borderColor: "#1e293b",
     borderRadius: 8,
-    padding: 8
-  },
-  telemetryLabel: {
-    fontSize: 8,
-    fontWeight: "bold",
-    color: "#6366f1",
-    letterSpacing: 1
-  },
-  telemetryValue: {
-    fontSize: 10,
-    color: "#94a3b8",
-    marginTop: 2
-  },
-  suggestionScrollView: {
-    flex: 1
-  },
-  suggestionContent: {
-    padding: 16,
-    paddingBottom: 40
-  },
-  loaderContainer: {
-    alignItems: "center",
-    justifyContent: "center",
-    paddingVertical: 60
-  },
-  loaderText: {
+    padding: 12,
     color: "#f8fafc",
-    fontSize: 12,
-    fontWeight: "bold",
-    letterSpacing: 1.5,
-    marginTop: 12
+    fontSize: 13,
+    marginBottom: 10,
   },
-  loaderSub: {
-    color: "#475569",
-    fontSize: 10,
-    marginTop: 4
-  },
-  emptyContainer: {
+  row: { flexDirection: "row", gap: 8, marginBottom: 10 },
+  secondaryBtn: {
+    flex: 1,
+    backgroundColor: "#1e293b",
+    paddingVertical: 10,
+    borderRadius: 8,
     alignItems: "center",
-    justifyContent: "center",
-    paddingVertical: 80,
-    paddingHorizontal: 30
   },
-  emptyTitle: {
-    color: "#fff",
-    fontSize: 15,
-    fontWeight: "bold",
-    marginTop: 12
+  secondaryBtnText: { color: "#cbd5e1", fontSize: 11, fontWeight: "600" },
+  subscribeBtn: {
+    backgroundColor: "#4f46e5",
+    paddingVertical: 12,
+    borderRadius: 10,
+    alignItems: "center",
+    marginBottom: 16,
   },
-  emptySubtitle: {
-    color: "#475569",
-    fontSize: 11,
-    textAlign: "center",
-    lineHeight: 18,
-    marginTop: 6
-  },
-  activeStreamBadge: {
+  subscribeBtnText: { color: "#fff", fontWeight: "bold", fontSize: 13 },
+  activeBadge: { color: "#34d399", fontSize: 11, marginBottom: 12 },
+  autoRow: {
     flexDirection: "row",
     alignItems: "center",
-    backgroundColor: "#1e1b4b",
+    justifyContent: "space-between",
+    marginVertical: 12,
+    paddingVertical: 8,
+  },
+  autoLabel: { color: "#94a3b8", fontSize: 11, flex: 1, marginRight: 8 },
+  primaryBtn: {
+    backgroundColor: "#4f46e5",
+    paddingVertical: 14,
+    borderRadius: 10,
+    alignItems: "center",
+    marginTop: 8,
+  },
+  primaryBtnDisabled: { opacity: 0.5 },
+  primaryBtnText: { color: "#fff", fontWeight: "bold", fontSize: 14 },
+  roomCard: {
+    backgroundColor: "#0f172a",
     borderWidth: 1,
     borderColor: "#312e81",
-    paddingHorizontal: 10,
-    paddingVertical: 5,
-    borderRadius: 4,
-    alignSelf: "flex-start",
-    marginBottom: 16
-  },
-  activeStreamBadgeText: {
-    color: "#818cf8",
-    fontSize: 9,
-    fontWeight: "bold",
-    letterSpacing: 1,
-    marginLeft: 6
-  },
-  historyBlock: {
-    borderBottomWidth: 1,
-    borderColor: "#1e293b",
-    paddingBottom: 24,
-    marginBottom: 24
-  },
-  historyMetaRow: {
-    flexDirection: "row",
-    justifyContent: "space-between",
-    marginBottom: 12
-  },
-  historyMetaText: {
-    fontSize: 9,
-    fontFamily: Platform.OS === "ios" ? "Courier" : "monospace",
-    color: "#475569"
-  },
-  codeContainer: {
-    backgroundColor: "#020617",
-    borderWidth: 1,
-    borderColor: "#1e293b",
     borderRadius: 12,
-    overflow: "hidden",
-    marginVertical: 12
-  },
-  codeHeader: {
-    height: 36,
-    backgroundColor: "#090d16",
-    flexDirection: "row",
+    padding: 16,
+    marginTop: 12,
     alignItems: "center",
-    justifyContent: "space-between",
-    paddingHorizontal: 12,
-    borderBottomWidth: 1,
-    borderColor: "#1e293b"
   },
-  codeHeaderText: {
-    color: "#94a3b8",
-    fontFamily: Platform.OS === "ios" ? "Courier" : "monospace",
-    fontSize: 10,
-    fontWeight: "bold",
-    marginLeft: 6
-  },
-  copyBtn: {
-    padding: 4
-  },
-  codeScroll: {
-    padding: 12
-  },
-  codeText: {
-    color: "#cbd5e1",
-    fontFamily: Platform.OS === "ios" ? "Courier" : "monospace",
-    fontSize: 12,
-    lineHeight: 18
-  },
-  header3Container: {
-    flexDirection: "row",
-    alignItems: "center",
-    marginTop: 18,
-    marginBottom: 8,
-    borderBottomWidth: 1,
-    borderColor: "#0f172a",
-    paddingBottom: 4
-  },
-  headerDot: {
-    width: 6,
-    height: 14,
+  roomLabel: { color: "#818cf8", fontSize: 9, fontWeight: "bold", letterSpacing: 1.5 },
+  roomCode: { color: "#fff", fontSize: 36, fontWeight: "bold", letterSpacing: 8, marginVertical: 8 },
+  roomHint: { color: "#64748b", fontSize: 10, textAlign: "center", lineHeight: 15 },
+  openLiveBtn: {
+    marginTop: 12,
     backgroundColor: "#4f46e5",
-    borderRadius: 2,
-    marginRight: 8
+    paddingHorizontal: 16,
+    paddingVertical: 10,
+    borderRadius: 8,
   },
-  header3Text: {
-    color: "#fff",
-    fontSize: 14,
-    fontWeight: "bold"
-  },
-  header2Text: {
-    color: "#fff",
-    fontSize: 16,
-    fontWeight: "bold",
-    marginTop: 22,
-    marginBottom: 10
-  },
-  bulletRow: {
+  openLiveBtnText: { color: "#fff", fontWeight: "bold", fontSize: 12 },
+  error: { color: "#f87171", fontSize: 11, marginTop: 8 },
+  liveWrap: { flex: 1 },
+  liveStatusBar: {
     flexDirection: "row",
-    marginLeft: 8,
-    marginBottom: 6,
-    alignItems: "flex-start"
+    alignItems: "center",
+    paddingHorizontal: 16,
+    paddingVertical: 10,
+    backgroundColor: "#0f172a",
+    borderBottomWidth: 1,
+    borderColor: "#1e293b",
+    gap: 10,
   },
-  bulletDot: {
-    color: "#6366f1",
-    fontSize: 14,
-    marginRight: 6,
-    fontWeight: "bold"
+  pauseBtn: {
+    backgroundColor: "#1e293b",
+    paddingHorizontal: 14,
+    paddingVertical: 10,
+    borderRadius: 8,
+    borderWidth: 1,
+    borderColor: "#334155",
   },
-  bulletText: {
-    color: "#94a3b8",
-    fontSize: 12,
-    lineHeight: 18,
-    flex: 1
+  pauseBtnActive: { backgroundColor: "#4f46e5", borderColor: "#6366f1" },
+  pauseBtnText: { color: "#fff", fontSize: 12, fontWeight: "bold" },
+  pausedBanner: {
+    backgroundColor: "#422006",
+    borderBottomWidth: 1,
+    borderColor: "#78350f",
+    paddingHorizontal: 16,
+    paddingVertical: 8,
   },
-  bodyText: {
-    color: "#cbd5e1",
-    fontSize: 12,
-    lineHeight: 18,
-    marginBottom: 10
-  }
+  pausedBannerText: { color: "#fcd34d", fontSize: 10, lineHeight: 14 },
+  liveStatusText: { color: "#818cf8", fontSize: 11, fontWeight: "bold" },
+  liveStatusSub: { color: "#64748b", fontSize: 9, marginTop: 2 },
+  transcriptBar: {
+    paddingHorizontal: 16,
+    paddingVertical: 8,
+    backgroundColor: "#020617",
+    borderBottomWidth: 1,
+    borderColor: "#111827",
+  },
+  transcriptLabel: { color: "#6366f1", fontSize: 8, fontWeight: "bold" },
+  transcriptText: { color: "#94a3b8", fontSize: 10, marginTop: 2 },
+  shotWrap: { padding: 12, borderBottomWidth: 1, borderColor: "#1e293b" },
+  shotLabel: { color: "#6366f1", fontSize: 9, fontWeight: "bold", marginBottom: 6 },
+  shotImage: { width: "100%", height: 120, backgroundColor: "#0f172a", borderRadius: 8 },
+  analyzeBtn: {
+    marginTop: 8,
+    backgroundColor: "#312e81",
+    paddingVertical: 8,
+    borderRadius: 8,
+    alignItems: "center",
+  },
+  analyzeBtnText: { color: "#c7d2fe", fontSize: 11, fontWeight: "bold" },
+  waitShot: { color: "#64748b", fontSize: 11, textAlign: "center", padding: 16 },
+  answerScroll: { flex: 1 },
+  answerPad: { padding: 16, paddingBottom: 40 },
+  loading: { alignItems: "center", paddingVertical: 24 },
+  loadingText: { color: "#94a3b8", fontSize: 11, marginTop: 8 },
+  answerCard: {
+    marginBottom: 20,
+    paddingBottom: 16,
+    borderBottomWidth: 1,
+    borderColor: "#1e293b",
+  },
+  answerMeta: { color: "#475569", fontSize: 9, marginBottom: 8, fontFamily: Platform.OS === "ios" ? "Courier" : "monospace" },
+  codeBox: { backgroundColor: "#0f172a", borderRadius: 8, marginVertical: 8, overflow: "hidden" },
+  codeHeader: { flexDirection: "row", justifyContent: "space-between", padding: 8, backgroundColor: "#020617" },
+  codeLang: { color: "#94a3b8", fontSize: 9, fontWeight: "bold" },
+  copyText: { color: "#818cf8", fontSize: 10 },
+  codeText: { color: "#cbd5e1", fontFamily: Platform.OS === "ios" ? "Courier" : "monospace", fontSize: 11, padding: 10 },
+  h3: { color: "#fff", fontSize: 14, fontWeight: "bold", marginTop: 10, marginBottom: 4 },
+  starLine: { color: "#c7d2fe", fontSize: 12, lineHeight: 18, marginBottom: 4, marginLeft: 4 },
+  bullet: { color: "#94a3b8", fontSize: 12, lineHeight: 18, marginLeft: 4, marginBottom: 4 },
+  body: { color: "#cbd5e1", fontSize: 12, lineHeight: 18, marginBottom: 6 },
 });

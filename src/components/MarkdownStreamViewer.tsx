@@ -10,11 +10,14 @@ export function MarkdownStreamViewer({ content, autoScroll = true }: MarkdownStr
   const containerRef = useRef<HTMLDivElement>(null);
   const [copiedIndex, setCopiedIndex] = React.useState<number | null>(null);
 
-  // Auto-scroll to the bottom when content streams in, mimicking physical speech-tracker views
+  // Auto-scroll to the bottom when content streams in (throttled for performance)
   useEffect(() => {
-    if (autoScroll && containerRef.current) {
-      containerRef.current.scrollIntoView({ behavior: "smooth", block: "end" });
-    }
+    if (!autoScroll || !containerRef.current) return;
+
+    const frame = requestAnimationFrame(() => {
+      containerRef.current?.scrollIntoView({ behavior: "smooth", block: "end" });
+    });
+    return () => cancelAnimationFrame(frame);
   }, [content, autoScroll]);
 
   // Handle code snippet copy actions

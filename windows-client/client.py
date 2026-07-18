@@ -1,328 +1,304 @@
 #!/usr/bin/env python3
 """
-TheInterviewHelper.com - Windows Capture Client (Phase 2)
-High-Performance, Sub-2-Second Screen & Audio Loopback Streamer.
+TheInterviewHelper.com - Windows Stealth Capture Client
+Runs hidden in the system tray. Captures full-screen screenshots and relays
+them to the paired Android app via the cloud relay server.
 
-This script runs on the candidate's local Windows OS, capturing:
-1. Low-latency compressed screenshots of the primary monitor.
-2. Output audio (WASAPI Loopback) containing the interviewer's voice.
-3. Global hotkeys (Ctrl+Shift+Space) to trigger real-time suggestions.
+Hotkey: Ctrl+Shift+Space — capture screen and send to Android
 """
 
+from __future__ import annotations
+
+import argparse
+import base64
+import io
+import logging
 import os
 import sys
-import time
-import base64
-import json
-import argparse
 import threading
-from io import BytesIO
+import time
 from datetime import datetime
+from typing import Optional
 
-# Dependencies check
 try:
     import mss
     from PIL import Image
     import socketio
     from pynput import keyboard
     import sounddevice as sd
-    import numpy as np
-except ImportError as e:
-    print("\n[!] Missing dependencies. Please run: pip install -r requirements.txt")
-    print(f"Error detail: {e}\n")
+except ImportError as exc:
+    print("Missing dependencies. Run: pip install -r requirements.txt")
+    print(exc)
     sys.exit(1)
 
-# Terminal Coloring utilities
-class Colors:
-    HEADER = '\033[95m'
-    OKBLUE = '\033[94m'
-    OKCYAN = '\033[96m'
-    OKGREEN = '\033[92m'
-    WARNING = '\033[93m'
-    FAIL = '\033[91m'
-    ENDC = '\033[0m'
-    BOLD = '\033[1m'
-    UNDERLINE = '\033[4m'
+DEFAULT_SERVER = "https://theinterviewhelpercom-production.up.railway.app"
+MAX_PAYLOAD_BYTES = 5 * 1024 * 1024
+LOG_FILE = os.path.join(os.environ.get("LOCALAPPDATA", "."), "InterviewHelper", "capture.log")
 
-def log(message, level="INFO"):
-    timestamp = datetime.now().strftime("%H:%M:%S.%f")[:-3]
-    color = Colors.OKBLUE
-    if level == "SUCCESS":
-        color = Colors.OKGREEN
-    elif level == "WARNING":
-        color = Colors.WARNING
-    elif level == "ERROR":
-        color = Colors.FAIL
-    elif level == "ACTION":
-        color = Colors.OKCYAN
-    print(f"{Colors.BOLD}[{timestamp}] [{level}]{Colors.ENDC} {color}{message}{Colors.ENDC}")
 
-# Core Capture & Socket Client App
+def setup_logging(stealth: bool) -> None:
+    os.makedirs(os.path.dirname(LOG_FILE), exist_ok=True)
+    handlers: list[logging.Handler] = [logging.FileHandler(LOG_FILE, encoding="utf-8")]
+    if not stealth:
+        handlers.append(logging.StreamHandler(sys.stdout))
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s [%(levelname)s] %(message)s",
+        handlers=handlers,
+    )
+
+
 class WindowsCaptureClient:
-    def __init__(self, server_url, room_code):
-        self.server_url = server_url
+    def __init__(self, server_url: str, room_code: str, stealth: bool = False):
+        self.server_url = server_url.rstrip("/")
         self.room_code = room_code
-        self.sio = socketio.Client(reconnection=True, reconnection_attempts=15, reconnection_delay=1)
-        self.hotkey_pressed = False
+        self.stealth = stealth
         self.is_running = True
-        self.audio_stream = None
-        self.keyboard_listener = None
-        
-        # Audio loopback config
-        self.sample_rate = 16000 # 16kHz is ideal for speech-to-text models
-        self.channels = 1
-        self.chunk_size = 1024
-        
-        # Initialize screenshot utility
+        self.connected = False
+        self.sio = socketio.Client(reconnection=True, reconnection_attempts=20, reconnection_delay=1)
         self.sct = mss.mss()
-        self.monitor = self.sct.monitors[1] # 1 is the primary screen
+        self.monitor = self.sct.monitors[1]
+        self.keyboard_listener: Optional[keyboard.Listener] = None
+        self.sample_rate = 16000
+        self._setup_socket_events()
 
-        # Register Socket.io events
-        self.setup_socket_events()
-
-    def setup_socket_events(self):
+    def _setup_socket_events(self) -> None:
         @self.sio.event
         def connect():
-            log(f"Connected successfully to WebSocket Relay: {self.server_url}", "SUCCESS")
-            # Automatically join the requested room channel
-            log(f"Attempting to join/pair with room channel: {self.room_code}", "ACTION")
-            self.sio.emit("join-room", {"roomCode": self.room_code}, callback=self.on_room_joined)
+            self.connected = True
+            logging.info("Connected to relay: %s", self.server_url)
+            self.sio.emit("join-room", {"roomCode": self.room_code}, callback=self._on_room_joined)
 
         @self.sio.event
         def disconnect():
-            log("Lost connection to WebSocket Relay server.", "WARNING")
+            self.connected = False
+            logging.warning("Disconnected from relay")
 
         @self.sio.on("paired")
         def on_paired(data):
-            log(f"Pairing Confirmed! Connected with {data.get('clientsCount', 1)} auxiliary devices.", "SUCCESS")
+            logging.info("Paired with room %s (%s clients)", self.room_code, data.get("clientsCount", 1))
 
-        @self.sio.on("ai-start")
-        def on_ai_start():
-            log("AI engine began synthesizing suggestions...", "ACTION")
+        @self.sio.on("stream-error")
+        def on_stream_error(data):
+            logging.error("Stream error: %s", data.get("error"))
 
-        @self.sio.on("ai-chunk")
-        def on_ai_chunk(data):
-            # Print streamed chunks to console for immediate debugging feedback
-            sys.stdout.write(f"{Colors.OKGREEN}{data.get('text', '')}{Colors.ENDC}")
-            sys.stdout.flush()
-
-        @self.sio.on("ai-end")
-        def on_ai_end(data):
-            print("\n")
-            log("AI Recommendation stream finished.", "SUCCESS")
-
-    def on_room_joined(self, response):
-        if response.get("success"):
-            log(f"Joined Room Code {self.room_code} successfully.", "SUCCESS")
-            log("Real-time loopback stream and hotkey listener are active.", "SUCCESS")
-            log("--- PRESS [Ctrl + Shift + Space] to trigger AI Suggestions ---", "BOLD")
+    def _on_room_joined(self, response) -> None:
+        if response and response.get("success"):
+            logging.info("Joined room %s — hotkey Ctrl+Shift+Space active", self.room_code)
         else:
-            log(f"Failed to join room channel: {response.get('error')}", "ERROR")
+            logging.error("Join failed: %s", (response or {}).get("error", "unknown"))
             self.stop()
 
-    def get_wasapi_loopback_device_index(self):
-        """
-        Scans available host devices to find Windows WASAPI loopback indices.
-        This captures whatever comes out of the computer speakers (e.g. interviewer on Teams/Zoom).
-        """
+    def capture_screenshot_base64(self) -> Optional[str]:
+        """Capture primary monitor at full resolution, compress to fit relay limit."""
+        try:
+            shot = self.sct.grab(self.monitor)
+            img = Image.frombytes("RGB", shot.size, shot.bgra, "raw", "BGRX")
+
+            quality = 88
+            while quality >= 40:
+                buf = io.BytesIO()
+                img.save(buf, format="JPEG", quality=quality, optimize=True)
+                raw = buf.getvalue()
+                if len(raw) <= MAX_PAYLOAD_BYTES - 256 * 1024:
+                    encoded = base64.b64encode(raw).decode("utf-8")
+                    logging.info("Screenshot captured %sx%s (%d KB, q=%d)", img.width, img.height, len(raw) // 1024, quality)
+                    return f"data:image/jpeg;base64,{encoded}"
+                quality -= 8
+
+            # Last resort: scale down if still too large
+            scale = 0.75
+            while scale >= 0.35:
+                resized = img.resize((int(img.width * scale), int(img.height * scale)), Image.Resampling.LANCZOS)
+                buf = io.BytesIO()
+                resized.save(buf, format="JPEG", quality=72, optimize=True)
+                raw = buf.getvalue()
+                if len(raw) <= MAX_PAYLOAD_BYTES - 256 * 1024:
+                    encoded = base64.b64encode(raw).decode("utf-8")
+                    logging.info("Screenshot scaled to %sx%s (%d KB)", resized.width, resized.height, len(raw) // 1024)
+                    return f"data:image/jpeg;base64,{encoded}"
+                scale -= 0.1
+
+            logging.error("Screenshot too large after compression")
+            return None
+        except Exception as exc:
+            logging.exception("Screenshot failed: %s", exc)
+            return None
+
+    def get_wasapi_loopback_device_index(self) -> Optional[int]:
         try:
             devices = sd.query_devices()
             host_apis = sd.query_hostapis()
-            
-            # Find WASAPI Host API index
-            wasapi_api_idx = -1
+            wasapi_idx = -1
             for idx, api in enumerate(host_apis):
                 if "wasapi" in api.get("name", "").lower():
-                    wasapi_api_idx = idx
+                    wasapi_idx = idx
                     break
-
-            if wasapi_api_idx == -1:
-                log("WASAPI Host API not found in system audio APIs.", "WARNING")
-                return sd.default.device[0] # Fallback to default input
-
-            # Find loopback device belonging to WASAPI
+            if wasapi_idx == -1:
+                return sd.default.device[0]
             for idx, dev in enumerate(devices):
-                if dev.get("hostapi") == wasapi_api_idx and dev.get("is_loopback", False):
-                    log(f"Found WASAPI Loopback audio device: {dev.get('name')} (Index: {idx})")
+                if dev.get("hostapi") == wasapi_idx and dev.get("is_loopback", False):
                     return idx
-                
-                # Check for alternative loopback names if specific flag is missing
-                if dev.get("hostapi") == wasapi_api_idx and "loopback" in dev.get("name", "").lower():
-                    log(f"Found loopback device via substring: {dev.get('name')} (Index: {idx})")
+                if dev.get("hostapi") == wasapi_idx and "loopback" in dev.get("name", "").lower():
                     return idx
-
-            log("No explicit WASAPI Loopback device found. Falling back to default system input.", "WARNING")
             return sd.default.device[0]
-        except Exception as e:
-            log(f"Error detecting audio loopback channels: {e}", "ERROR")
+        except Exception as exc:
+            logging.warning("WASAPI loopback not found: %s", exc)
             return None
 
-    def capture_screenshot_base64(self):
-        """
-        Captures the screen extremely fast, resizes, compresses to high-performance JPEG,
-        and serializes to a clean base64 string.
-        """
+    def capture_audio_wav_base64(self, duration: float = 2.5) -> Optional[str]:
+        """Capture recent system audio (interviewer on Zoom/Teams) via WASAPI loopback."""
         try:
-            # Ultra-fast PNG capture from frame buffer
-            sct_img = self.sct.grab(self.monitor)
-            img = Image.frombytes("RGB", sct_img.size, sct_img.bgra, "raw", "BGRX")
-            
-            # Subscale image to save network transport overhead (target 720p maximum)
-            max_width = 1280
-            if img.width > max_width:
-                ratio = max_width / float(img.width)
-                new_height = int(float(img.height) * float(ratio))
-                img = img.resize((max_width, new_height), Image.Resampling.LANCZOS)
-
-            # Compress as high-performance JPEG (quality 55 for speed over resolution)
-            output = BytesIO()
-            img.save(output, format="JPEG", quality=55)
-            img_bytes = output.getvalue()
-            
-            base64_data = base64.b64encode(img_bytes).decode("utf-8")
-            return f"data:image/jpeg;base64,{base64_data}"
-        except Exception as e:
-            log(f"Screenshot capture failed: {e}", "ERROR")
+            import wave
+            device_idx = self.get_wasapi_loopback_device_index()
+            if device_idx is None:
+                return None
+            frames = int(duration * self.sample_rate)
+            recording = sd.rec(frames, samplerate=self.sample_rate, channels=1, device=device_idx, dtype="int16")
+            sd.wait()
+            buf = io.BytesIO()
+            with wave.open(buf, "wb") as wf:
+                wf.setnchannels(1)
+                wf.setsampwidth(2)
+                wf.setframerate(self.sample_rate)
+                wf.writeframes(recording.tobytes())
+            encoded = base64.b64encode(buf.getvalue()).decode("utf-8")
+            return encoded
+        except Exception as exc:
+            logging.warning("Audio capture skipped: %s", exc)
             return None
 
-    def audio_callback(self, indata, frames, time_info, status):
-        """
-        Processes audio input buffer stream in real-time.
-        """
-        if status:
-            log(f"Audio status warning: {status}", "WARNING")
-        
-        # Audio chunk analysis can be performed here (e.g. compute amplitude, silence gates, or pipe to server)
-        # We also emit standard heartbeat indicators to keep connection lines hot
-        pass
-
-    def start_audio_capture(self):
-        device_idx = self.get_wasapi_loopback_device_index()
-        if device_idx is None:
-            log("Skipping audio stream capture due to initialization failure.", "WARNING")
+    def send_screenshot_to_android(self) -> None:
+        if not self.connected:
+            logging.warning("Not connected — cannot send screenshot")
             return
 
-        try:
-            self.audio_stream = sd.InputStream(
-                device=device_idx,
-                channels=self.channels,
-                samplerate=self.sample_rate,
-                blocksize=self.chunk_size,
-                callback=self.audio_callback
-            )
-            self.audio_stream.start()
-            log("Output loopback stream successfully initiated.", "SUCCESS")
-        except Exception as e:
-            log(f"Failed to start loopback audio input stream: {e}", "ERROR")
-
-    def on_hotkey(self):
-        """
-        Action triggered when Ctrl+Shift+Space combination is pressed.
-        """
-        log("Hotkey combo triggered! Compiling real-time interview state...", "ACTION")
-        
-        # Capture screenshot
-        screenshot_base64 = self.capture_screenshot_base64()
-        if not screenshot_base64:
-            log("Cannot synthesize screenshot. Aborting AI request.", "ERROR")
+        image_b64 = self.capture_screenshot_base64()
+        if not image_b64:
             return
 
-        # Emit optimized request-ai-assist payload to the server
-        log("Casting payload over WebSocket to Gemini optimizer...", "ACTION")
-        self.sio.emit("request-ai-assist", {
-            "image": screenshot_base64,
-            "audioTranscript": "Explain the optimal strategy and write clean code for the challenge shown on the screen.",
-            "timestamp": time.time()
-        })
+        timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+        audio_b64 = self.capture_audio_wav_base64()
+        payload = {
+            "image": image_b64,
+            "imageName": f"screen-{timestamp}.jpg",
+            "imageText": "Full-screen capture from Windows client",
+            "source": "windows-stealth",
+            "timestamp": time.time(),
+        }
+        if audio_b64:
+            payload["audioBase64"] = audio_b64
+            payload["audioMimeType"] = "audio/wav"
+        self.sio.emit("stream-data", payload)
+        logging.info("Screenshot sent to Android via room %s", self.room_code)
 
-    def run_keyboard_listener(self):
-        """
-        Listens globally for Ctrl+Shift+Space on Windows.
-        """
-        # Define modern hotkey pairing
-        combination = {keyboard.Key.ctrl_l, keyboard.Key.shift_l, keyboard.Key.space}
-        current_keys = set()
+    def _run_hotkey_listener(self) -> None:
+        combo = {keyboard.Key.ctrl_l, keyboard.Key.shift_l, keyboard.Key.space}
+        pressed: set = set()
+
+        def normalize(key):
+            if key in (keyboard.Key.ctrl_l, keyboard.Key.ctrl_r):
+                return keyboard.Key.ctrl_l
+            if key in (keyboard.Key.shift_l, keyboard.Key.shift_r):
+                return keyboard.Key.shift_l
+            if key == keyboard.Key.space:
+                return keyboard.Key.space
+            return key
 
         def on_press(key):
-            # Normalise keys
-            if key in [keyboard.Key.ctrl_l, keyboard.Key.ctrl_r]:
-                current_keys.add(keyboard.Key.ctrl_l)
-            elif key in [keyboard.Key.shift_l, keyboard.Key.shift_r]:
-                current_keys.add(keyboard.Key.shift_l)
-            elif hasattr(key, 'char') and key.char == ' ':
-                current_keys.add(keyboard.Key.space)
-            elif key == keyboard.Key.space:
-                current_keys.add(keyboard.Key.space)
-
-            # Check matching combo
-            if all(k in current_keys for k in combination):
-                self.on_hotkey()
+            pressed.add(normalize(key))
+            if combo.issubset(pressed):
+                threading.Thread(target=self.send_screenshot_to_android, daemon=True).start()
 
         def on_release(key):
-            if key in [keyboard.Key.ctrl_l, keyboard.Key.ctrl_r]:
-                current_keys.discard(keyboard.Key.ctrl_l)
-            elif key in [keyboard.Key.shift_l, keyboard.Key.shift_r]:
-                current_keys.discard(keyboard.Key.shift_l)
-            elif hasattr(key, 'char') and key.char == ' ':
-                current_keys.discard(keyboard.Key.space)
-            elif key == keyboard.Key.space:
-                current_keys.discard(keyboard.Key.space)
+            pressed.discard(normalize(key))
 
         self.keyboard_listener = keyboard.Listener(on_press=on_press, on_release=on_release)
         self.keyboard_listener.start()
 
-    def start(self):
-        try:
-            # 1. Connect to WebSocket Relay
-            log(f"Connecting to {self.server_url}...", "ACTION")
-            self.sio.connect(self.server_url)
+    def connect_and_run(self) -> None:
+        logging.info("Connecting to %s …", self.server_url)
+        self.sio.connect(self.server_url, transports=["websocket", "polling"])
+        self._run_hotkey_listener()
+        while self.is_running:
+            time.sleep(0.5)
 
-            # 2. Start WASAPI Audio loopback capturing
-            self.start_audio_capture()
-
-            # 3. Start Global Hotkey listener thread
-            self.run_keyboard_listener()
-
-            # Keep main thread alive
-            while self.is_running:
-                time.sleep(0.5)
-
-        except KeyboardInterrupt:
-            log("Gracefully stopping the local capture agent...", "WARNING")
-        except Exception as e:
-            log(f"Critical runtime exception: {e}", "ERROR")
-        finally:
-            self.stop()
-
-    def stop(self):
+    def stop(self) -> None:
         self.is_running = False
-        
-        # Cleanup audio stream
-        if self.audio_stream:
-            try:
-                self.audio_stream.stop()
-                self.audio_stream.close()
-                log("Audio loopback stream successfully closed.")
-            except Exception:
-                pass
-
-        # Cleanup keyboard listeners
         if self.keyboard_listener:
             try:
                 self.keyboard_listener.stop()
             except Exception:
                 pass
-
-        # Disconnect socket
         if self.sio.connected:
             self.sio.disconnect()
-            log("WebSocket session terminated cleanly.")
+
+
+def run_stealth_tray(client: WindowsCaptureClient) -> None:
+    try:
+        import pystray
+        from PIL import ImageDraw
+    except ImportError:
+        logging.error("pystray not installed. Run: pip install pystray")
+        client.connect_and_run()
+        return
+
+    def create_icon_image():
+        img = Image.new("RGB", (64, 64), color=(79, 70, 229))
+        draw = ImageDraw.Draw(img)
+        draw.rectangle((16, 16, 48, 48), fill=(129, 140, 248))
+        return img
+
+    def on_capture(icon, _item):
+        threading.Thread(target=client.send_screenshot_to_android, daemon=True).start()
+
+    def on_quit(icon, _item):
+        client.stop()
+        icon.stop()
+
+    menu = pystray.Menu(
+        pystray.MenuItem("Capture & send to phone", on_capture),
+        pystray.MenuItem("Quit", on_quit),
+    )
+    icon = pystray.Icon(
+        "InterviewHelperCapture",
+        create_icon_image(),
+        f"Interview Helper — Room {client.room_code}",
+        menu,
+    )
+
+    worker = threading.Thread(target=client.connect_and_run, daemon=True)
+    worker.start()
+    icon.run()
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(description="Interview Helper — Windows stealth capture client")
+    parser.add_argument("--server", default=DEFAULT_SERVER, help="Relay server URL")
+    parser.add_argument("--room", required=True, help="6-digit pairing code from Android app")
+    parser.add_argument("--stealth", action="store_true", help="Run hidden in system tray (no console)")
+    return parser.parse_args()
+
+
+def main():
+    args = parse_args()
+    if len(args.room) != 6 or not args.room.isdigit():
+        print("Error: --room must be a 6-digit code from the Android app")
+        sys.exit(1)
+
+    setup_logging(args.stealth)
+    client = WindowsCaptureClient(args.server, args.room, stealth=args.stealth)
+
+    if args.stealth:
+        run_stealth_tray(client)
+    else:
+        try:
+            client.connect_and_run()
+        except KeyboardInterrupt:
+            pass
+        finally:
+            client.stop()
+
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="TheInterviewHelper - Windows Capture Agent")
-    parser.add_argument("--server", type=str, default="http://localhost:3000", help="Relay Server URL")
-    parser.add_argument("--room", type=str, required=True, help="6-digit room code to join")
-    args = parser.parse_args()
-
-    client = WindowsCaptureClient(args.server, args.room)
-    client.start()
+    main()

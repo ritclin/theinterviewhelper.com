@@ -1,13 +1,62 @@
 import express from "express";
 import http from "http";
 import path from "path";
+import fs from "fs";
+import helmet from "helmet";
+import rateLimit from "express-rate-limit";
 import { Server as SocketIOServer } from "socket.io";
 import { createServer as createViteServer } from "vite";
 import { GoogleGenAI } from "@google/genai";
 import dotenv from "dotenv";
 import Stripe from "stripe";
+import {
+  generateSecureRoomCode,
+  getAllowedOrigins,
+  isValidRoomCode,
+  requireAdminKey,
+  sanitizeRedirectUrl,
+  estimateBase64Bytes,
+  LIMITS,
+} from "./security.ts";
 
 dotenv.config();
+
+const DOWNLOADS_DIR = path.join(process.cwd(), "public", "downloads");
+
+function getDownloadFileInfo(name: string, minBytes: number) {
+  const filePath = path.join(DOWNLOADS_DIR, name);
+  if (!fs.existsSync(filePath)) {
+    return { present: false, valid: false, bytes: 0 };
+  }
+  const bytes = fs.statSync(filePath).size;
+  if (bytes < minBytes) {
+    try {
+      const head = fs.readFileSync(filePath, "utf8").slice(0, 80);
+      if (head.includes("git-lfs")) {
+        return { present: true, valid: false, bytes };
+      }
+    } catch {
+      /* binary file */
+    }
+    return { present: true, valid: false, bytes };
+  }
+  return { present: true, valid: true, bytes };
+}
+
+function downloadContentType(filePath: string): string | undefined {
+  const name = path.basename(filePath).toLowerCase();
+  if (name.endsWith(".apk")) return "application/vnd.android.package-archive";
+  if (name.endsWith(".exe")) return "application/vnd.microsoft.portable-executable";
+  if (name.endsWith(".zip")) return "application/zip";
+  return undefined;
+}
+
+function isRunningProductionBundle(): boolean {
+  if (process.env.NODE_ENV === "production") return true;
+  if (process.argv[1]?.endsWith("server.cjs")) return true;
+  if (typeof __filename !== "undefined" && __filename.endsWith("server.cjs")) return true;
+  return false;
+}
 
 // Initialize Gemini SDK with named parameters as instructed
 const apiKey = process.env.GEMINI_API_KEY;
@@ -29,15 +78,48 @@ if (apiKey && apiKey !== "MY_GEMINI_API_KEY" && apiKey.trim() !== "") {
 
 async function startServer() {
   const app = express();
+  const isProduction = isRunningProductionBundle();
+  console.log(`Runtime mode: ${isProduction ? "production" : "development"} (NODE_ENV=${process.env.NODE_ENV ?? "unset"})`);
+  app.set("trust proxy", 1);
+
+  app.use(
+    helmet({
+      contentSecurityPolicy: isProduction
+        ? {
+            directives: {
+              defaultSrc: ["'self'"],
+              scriptSrc: ["'self'"],
+              styleSrc: ["'self'", "'unsafe-inline'"],
+              imgSrc: ["'self'", "data:", "https:"],
+              connectSrc: ["'self'", "wss:", "ws:"],
+              fontSrc: ["'self'", "data:"],
+              objectSrc: ["'none'"],
+              frameAncestors: ["'none'"],
+            },
+          }
+        : false,
+      crossOriginEmbedderPolicy: false,
+    })
+  );
+
+  const apiLimiter = rateLimit({
+    windowMs: 15 * 60 * 1000,
+    max: isProduction ? 300 : 1000,
+    standardHeaders: true,
+    legacyHeaders: false,
+  });
+  app.use("/api/", apiLimiter);
+
   const server = http.createServer(app);
-  const PORT = 3000;
+  const PORT = Number(process.env.PORT) || 3000;
+  const allowedOrigins = getAllowedOrigins();
   
-  // Socket.io with wide CORS for cross-platform clients (Desktop PySocketIO and React Native Expo)
   const io = new SocketIOServer(server, {
     cors: {
-      origin: "*",
+      origin: allowedOrigins,
       methods: ["GET", "POST"]
-    }
+    },
+    maxHttpBufferSize: LIMITS.MAX_IMAGE_BYTES + 512 * 1024,
   });
 
   // Room pairing state
@@ -46,9 +128,21 @@ async function startServer() {
     hostSocketId: string;
     clientSocketIds: string[];
     created: number;
+    ownerEmail: string;
     history: Array<{ role: string; content: string; timestamp: string }>;
     scenario?: { title: string; company: string; role: string; };
+    profile?: {
+      targetPosition: string;
+      company: string;
+      jobDescription: string;
+      userCv: string;
+      specialInstructions: string;
+    };
+    aiInProgress?: boolean;
   }>();
+
+  const joinAttemptsByIp = new Map<string, { count: number; resetAt: number }>();
+  const aiRequestTimestamps = new Map<string, number[]>();
 
   // Map of socket.id -> roomCode to handle cleanups
   const socketToRoom = new Map<string, string>();
@@ -65,21 +159,135 @@ async function startServer() {
     return stripeClient;
   }
 
-  // In-memory subscription ledger: email -> subscription info
-  // Seed rcsequeira@google.com as unsubscribed by default so they can test the signup workflow,
-  // but they can also subscribe instantly via one-click in the UI!
+  // Subscription ledger: email -> subscription info (persisted to disk)
   const subscriptions = new Map<string, {
     status: "active" | "canceled" | "none";
     email: string;
     currentPeriodEnd: number;
     subscriptionId?: string;
-  }>([
-    ["rcsequeira@google.com", {
-      status: "none",
-      email: "rcsequeira@google.com",
-      currentPeriodEnd: 0
-    }]
-  ]);
+  }>();
+
+  const SUBSCRIPTIONS_FILE = path.join(process.cwd(), "data", "subscriptions.json");
+  const SUBSCRIPTION_PRICE_EUR = 20;
+
+  function loadSubscriptionsFromDisk() {
+    try {
+      if (fs.existsSync(SUBSCRIPTIONS_FILE)) {
+        const raw = JSON.parse(fs.readFileSync(SUBSCRIPTIONS_FILE, "utf-8")) as Record<string, {
+          status: "active" | "canceled" | "none";
+          email: string;
+          currentPeriodEnd: number;
+          subscriptionId?: string;
+        }>;
+        for (const [email, sub] of Object.entries(raw)) {
+          subscriptions.set(email.toLowerCase().trim(), sub);
+        }
+        console.log(`[Billing] Loaded ${subscriptions.size} subscription record(s) from disk.`);
+      }
+    } catch (err) {
+      console.warn("[Billing] Could not load subscriptions file:", err);
+    }
+  }
+
+  function persistSubscriptionsToDisk() {
+    try {
+      const dir = path.dirname(SUBSCRIPTIONS_FILE);
+      if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+      const payload: Record<string, unknown> = {};
+      subscriptions.forEach((value, key) => {
+        payload[key] = value;
+      });
+      fs.writeFileSync(SUBSCRIPTIONS_FILE, JSON.stringify(payload, null, 2));
+    } catch (err) {
+      console.warn("[Billing] Could not persist subscriptions:", err);
+    }
+  }
+
+  function hasActiveSubscription(email: string): boolean {
+    const normalized = email.toLowerCase().trim();
+    if (!normalized) return false;
+    const sub = subscriptions.get(normalized);
+    if (!sub || sub.status !== "active") return false;
+    if (sub.currentPeriodEnd <= Date.now()) {
+      subscriptions.set(normalized, { ...sub, status: "none", currentPeriodEnd: Date.now() });
+      persistSubscriptionsToDisk();
+      return false;
+    }
+    return true;
+  }
+
+  function requireActiveSubscriptionForRoom(room: { ownerEmail?: string } | undefined): string | null {
+    if (!room?.ownerEmail) return "Room has no active subscription owner.";
+    if (!hasActiveSubscription(room.ownerEmail)) {
+      return "Active €20/month subscription required. Subscribe on the website.";
+    }
+    return null;
+  }
+
+  loadSubscriptionsFromDisk();
+
+  function activateSubscription(email: string, subscriptionId?: string, currentPeriodEndMs?: number) {
+    const normalized = email.toLowerCase().trim();
+    if (!normalized) return null;
+    const sub = {
+      status: "active" as const,
+      email: normalized,
+      currentPeriodEnd: currentPeriodEndMs && currentPeriodEndMs > Date.now()
+        ? currentPeriodEndMs
+        : Date.now() + 30 * 24 * 60 * 60 * 1000,
+      subscriptionId: subscriptionId || "sub_" + Math.random().toString(36).substring(2, 10),
+    };
+    subscriptions.set(normalized, sub);
+    persistSubscriptionsToDisk();
+    console.log(`[Billing] Subscription activated for: ${normalized}`);
+    return sub;
+  }
+
+  async function syncSubscriptionFromStripe(targetEmail: string) {
+    const normalized = targetEmail.toLowerCase().trim();
+    if (!normalized) return null;
+
+    const stripe = getStripe();
+    if (!stripe) return null;
+
+    try {
+      const customers = await stripe.customers.list({ email: normalized, limit: 5 });
+      for (const customer of customers.data) {
+        const activeSubs = await stripe.subscriptions.list({
+          customer: customer.id,
+          status: "active",
+          limit: 1,
+        });
+        const trialingSubs = await stripe.subscriptions.list({
+          customer: customer.id,
+          status: "trialing",
+          limit: 1,
+        });
+        const match = activeSubs.data[0] || trialingSubs.data[0];
+        if (match) {
+          const periodEnd = match.current_period_end ? match.current_period_end * 1000 : undefined;
+          return activateSubscription(normalized, match.id, periodEnd);
+        }
+      }
+    } catch (err) {
+      console.warn("[Billing] syncSubscriptionFromStripe error:", err);
+    }
+    return null;
+  }
+
+  async function resolveStripeCustomerEmail(stripe: Stripe, customerRef: unknown): Promise<string> {
+    if (typeof customerRef === "string") {
+      try {
+        const customer = await stripe.customers.retrieve(customerRef);
+        if (!customer.deleted && "email" in customer && customer.email) {
+          return customer.email.toLowerCase().trim();
+        }
+      } catch (err) {
+        console.warn("[Billing] Could not resolve Stripe customer email:", err);
+      }
+    }
+    return "";
+  }
 
   // Webhook event logger
   const webhookLogs: Array<{
@@ -247,7 +455,11 @@ LIMIT 50;
   // Helper to upsert completed or active sessions
   function saveOrUpdateSession(roomCode: string, room: any, isFinished = false) {
     const existingIndex = completedSessions.findIndex(s => s.roomCode === roomCode);
-    const scenario = room.scenario || { title: "Custom Coding Session", company: "Technical Practice", role: "Developer" };
+    const scenario = room.scenario || {
+      title: room.profile?.targetPosition || "Interview Session",
+      company: room.profile?.company || "Target Company",
+      role: room.profile?.targetPosition || "Candidate",
+    };
     
     const sessionData = {
       id: existingIndex >= 0 ? completedSessions[existingIndex].id : "sess_" + Math.random().toString(36).substring(2, 10),
@@ -266,7 +478,66 @@ LIMIT 50;
     }
   }
 
-  // Stripe Raw Webhook endpoint - MUST be defined before express.json()
+  function isLikelyBase64Image(value: string): boolean {
+    if (!value || value.length < 200) return false;
+    if (value.includes("base64,")) return true;
+    const sample = value.replace(/\s/g, "").slice(0, 400);
+    return /^[A-Za-z0-9+/=]+$/.test(sample) && sample.length > 200;
+  }
+
+  function buildPersonalizedSystemInstruction(profile?: {
+    targetPosition?: string;
+    company?: string;
+    jobDescription?: string;
+    userCv?: string;
+    specialInstructions?: string;
+  }): string {
+    let instruction = `You are "The Interview Helper", an elite real-time interview coach.
+Your job is to help the candidate succeed in a live interview by analyzing the interviewer's questions, screen content, and the candidate's background.
+
+ANSWER FORMAT — always use this structure in Markdown:
+
+### 🎯 IDENTIFIED QUESTION
+One line naming the question or task.
+
+### ⭐ STAR RESPONSE
+For behavioral, situational, and experience questions, answer using STAR with bullets tied to the candidate's CV:
+- **Situation**: Brief context from a relevant role/project (prefer CV examples).
+- **Task**: What you were responsible for.
+- **Action**: Specific steps you took (use "I" statements the candidate can speak aloud).
+- **Result**: Quantified outcome or impact when possible.
+
+For technical/coding/screen questions, still include STAR when explaining approach, plus:
+### 💡 TECHNICAL STRATEGY
+2-3 bullets: approach, complexity, data structures, or architecture.
+
+### 💻 GOLDEN CODE (when relevant)
+Minimal clean code matching the question language.
+
+### 🗣️ SAY THIS ALOUD
+2 short bullet lines the candidate can read verbatim in the interview.
+
+Rules: No greetings. Scannable in 5-8 seconds. Be accurate to the candidate's seniority and the job description.`;
+
+    if (profile?.targetPosition?.trim()) {
+      instruction += `\n\n--- CANDIDATE TARGET ROLE ---\nPosition: ${profile.targetPosition.trim()}`;
+      if (profile.company?.trim()) {
+        instruction += `\nCompany: ${profile.company.trim()}`;
+      }
+      if (profile.jobDescription?.trim()) {
+        instruction += `\n\n--- JOB DESCRIPTION ---\n${profile.jobDescription.trim().slice(0, LIMITS.MAX_JOB_DESCRIPTION_CHARS)}`;
+      }
+      if (profile.userCv?.trim()) {
+        instruction += `\n\n--- CANDIDATE CV / RESUME ---\n${profile.userCv.trim().slice(0, LIMITS.MAX_CV_CHARS)}`;
+      }
+      if (profile.specialInstructions?.trim()) {
+        instruction += `\n\n--- SPECIAL INSTRUCTIONS ---\n${profile.specialInstructions.trim().slice(0, LIMITS.MAX_SPECIAL_INSTRUCTIONS_CHARS)}`;
+      }
+      instruction += `\n\nTailor every STAR example to this role. Pull Situation/Action/Result from the CV when possible. Match seniority and tech stack from the job description.`;
+    }
+
+    return instruction;
+  }
   app.post("/api/webhooks", express.raw({ type: "application/json" }), async (req, res) => {
     const stripe = getStripe();
     const sig = req.headers["stripe-signature"];
@@ -276,13 +547,17 @@ LIMIT 50;
     const logId = "whl_" + Math.random().toString(36).substring(2, 10);
     
     try {
+      if (isProduction && (!stripe || !sig || !webhookSecret)) {
+        return res.status(503).json({ error: "Stripe webhooks are not configured." });
+      }
+
       if (stripe && sig && webhookSecret) {
-        // Real Stripe webhook verification
         event = stripe.webhooks.constructEvent(req.body, sig as string, webhookSecret);
-      } else {
-        // Fallback: parse direct raw buffer or JSON body
+      } else if (!isProduction) {
         const bodyString = Buffer.isBuffer(req.body) ? req.body.toString() : JSON.stringify(req.body);
         event = JSON.parse(bodyString);
+      } else {
+        return res.status(400).send("Webhook Error: Invalid signature.");
       }
     } catch (err: any) {
       console.error(`[Webhook Verification Error]: ${err.message}`);
@@ -302,19 +577,16 @@ LIMIT 50;
       console.log(`[Stripe Webhook Engine] Event Received: ${eventType}`);
 
       if (eventType === "checkout.session.completed") {
-        const email = (dataObject.customer_email || dataObject.customer_details?.email || "").toLowerCase().trim();
+        const email = (dataObject.customer_email || dataObject.customer_details?.email || dataObject.metadata?.email || "").toLowerCase().trim();
         const subId = dataObject.subscription || "sub_mock_" + Math.random().toString(36).substring(2, 10);
         if (email) {
-          subscriptions.set(email, {
-            status: "active",
-            email,
-            currentPeriodEnd: Date.now() + 30 * 24 * 60 * 60 * 1000,
-            subscriptionId: subId
-          });
-          console.log(`[Stripe Webhook Engine] Subscription activated for: ${email}`);
+          activateSubscription(email, subId);
         }
       } else if (eventType === "customer.subscription.deleted") {
-        const email = (dataObject.customer_email || "").toLowerCase().trim();
+        let email = (dataObject.customer_email || dataObject.metadata?.email || "").toLowerCase().trim();
+        if (!email && stripe) {
+          email = await resolveStripeCustomerEmail(stripe, dataObject.customer);
+        }
         if (email) {
           const sub = subscriptions.get(email);
           if (sub) {
@@ -323,18 +595,27 @@ LIMIT 50;
               status: "none",
               currentPeriodEnd: Date.now()
             });
+            persistSubscriptionsToDisk();
           }
           console.log(`[Stripe Webhook Engine] Subscription deleted for: ${email}`);
         }
-      } else if (eventType === "customer.subscription.updated") {
-        const email = (dataObject.customer_email || "").toLowerCase().trim();
+      } else if (eventType === "customer.subscription.updated" || eventType === "customer.subscription.created") {
+        let email = (dataObject.customer_email || dataObject.metadata?.email || "").toLowerCase().trim();
+        if (!email && stripe) {
+          email = await resolveStripeCustomerEmail(stripe, dataObject.customer);
+        }
         if (email) {
-          const sub = subscriptions.get(email);
-          if (sub) {
-            subscriptions.set(email, {
-              ...sub,
-              status: dataObject.status === "active" ? "active" : "canceled"
-            });
+          if (dataObject.status === "active" || dataObject.status === "trialing") {
+            activateSubscription(email, dataObject.id);
+          } else {
+            const sub = subscriptions.get(email);
+            if (sub) {
+              subscriptions.set(email, {
+                ...sub,
+                status: dataObject.status === "active" ? "active" : "canceled"
+              });
+              persistSubscriptionsToDisk();
+            }
           }
         }
       }
@@ -363,24 +644,211 @@ LIMIT 50;
   });
 
   // API middleware for general JSON routes
-  app.use(express.json({ limit: "50mb" }));
-  app.use(express.urlencoded({ limit: "50mb", extended: true }));
+  app.use(express.json({ limit: LIMITS.JSON_BODY }));
+  app.use(express.urlencoded({ limit: LIMITS.JSON_BODY, extended: true }));
 
   // Stripe Helper Endpoints
-  app.get("/api/stripe/status", (req, res) => {
-    const email = (req.query.email as string || "rcsequeira@google.com").toLowerCase().trim();
-    const sub = subscriptions.get(email) || { status: "none", email, currentPeriodEnd: 0 };
-    res.json(sub);
+  app.get("/api/stripe/plan", (_req, res) => {
+    res.json({
+      success: true,
+      plan: {
+        name: "Platinum Access",
+        priceEur: SUBSCRIPTION_PRICE_EUR,
+        currency: "eur",
+        interval: "month",
+        description: "Real-time interview assistance with screen capture pairing and personalized AI answers.",
+      },
+    });
   });
 
-  app.get("/api/stripe/webhook-logs", (req, res) => {
+  app.get("/api/downloads", (_req, res) => {
+    const apk = getDownloadFileInfo("interview-helper.apk", 5_000_000);
+    const exe = getDownloadFileInfo("InterviewHelperCapture.exe", 5_000_000);
+    const zip = getDownloadFileInfo("interview-helper-windows.zip", 5_000_000);
+    res.json({
+      success: true,
+      downloads: {
+        windowsZip: zip.valid ? "/downloads/interview-helper-windows.zip" : "/downloads/interview-helper-windows.zip",
+        windowsExe: exe.valid ? "/downloads/InterviewHelperCapture.exe" : "/downloads/InterviewHelperCapture.exe",
+        androidApk: apk.valid ? "/downloads/interview-helper.apk" : (process.env.ANDROID_APK_URL || "/downloads/interview-helper.apk"),
+        androidPlayStore: process.env.ANDROID_PLAY_STORE_URL || null,
+        filesPresent: {
+          apk: apk.present,
+          exe: exe.present,
+          zip: zip.present,
+        },
+        filesValid: {
+          apk: apk.valid,
+          exe: exe.valid,
+          zip: zip.valid,
+        },
+        fileSizes: {
+          apk: apk.bytes,
+          exe: exe.bytes,
+          zip: zip.bytes,
+        },
+      },
+    });
+  });
+
+  app.post("/api/transcribe-audio", async (req, res) => {
+    const { email, audioBase64, mimeType, roomCode } = req.body || {};
+    const targetEmail = String(email || "").toLowerCase().trim();
+    if (!targetEmail) {
+      return res.status(400).json({ success: false, error: "Email is required." });
+    }
+    if (!hasActiveSubscription(targetEmail)) {
+      await syncSubscriptionFromStripe(targetEmail);
+    }
+    if (!hasActiveSubscription(targetEmail)) {
+      return res.status(403).json({ success: false, error: "Active subscription required.", code: "SUBSCRIPTION_REQUIRED" });
+    }
+    if (!audioBase64 || typeof audioBase64 !== "string") {
+      return res.status(400).json({ success: false, error: "Audio payload required." });
+    }
+    const raw = audioBase64.includes("base64,") ? audioBase64.split("base64,")[1] : audioBase64;
+    if (estimateBase64Bytes(raw) > LIMITS.MAX_AUDIO_BYTES) {
+      return res.status(400).json({ success: false, error: "Audio exceeds size limit." });
+    }
+
+    const audioMime = typeof mimeType === "string" ? mimeType : "audio/mp4";
+    let transcript = "";
+
+    if (aiClient) {
+      try {
+        const geminiModel = process.env.GEMINI_MODEL || "gemini-2.5-flash";
+        const result = await aiClient.models.generateContent({
+          model: geminiModel,
+          contents: [
+            { inlineData: { mimeType: audioMime, data: raw } },
+            { text: "Transcribe all spoken interview questions and dialogue in this audio clip. Return only the transcript text, no commentary." },
+          ],
+        });
+        transcript = (result.text || "").trim();
+      } catch (err: any) {
+        console.error("[Transcribe] Gemini error:", err.message);
+        return res.status(500).json({ success: false, error: "Transcription failed." });
+      }
+    } else {
+      transcript = "[Simulated transcript] Explain the time complexity of your solution and walk through the algorithm.";
+    }
+
+    if (roomCode && isValidRoomCode(roomCode)) {
+      const room = rooms.get(roomCode);
+      if (room && hasActiveSubscription(room.ownerEmail)) {
+        io.to(`room-${roomCode}`).emit("stream-feed", {
+          audioTranscript: transcript,
+          source: "voice-listener",
+          timestamp: Date.now(),
+        });
+      }
+    }
+
+    res.json({ success: true, transcript });
+  });
+
+  app.get("/api/stripe/status", (req, res) => {
+    const email = (req.query.email as string || "").toLowerCase().trim();
+    if (!email) {
+      return res.status(400).json({ success: false, error: "Email query parameter is required." });
+    }
+    const sub = subscriptions.get(email) || { status: "none" as const, email, currentPeriodEnd: 0 };
+    res.json({ success: true, ...sub });
+  });
+
+  app.post("/api/stripe/confirm-session", async (req, res) => {
+    const { sessionId } = req.body || {};
+    const stripe = getStripe();
+
+    if (!sessionId || typeof sessionId !== "string") {
+      return res.status(400).json({ success: false, error: "sessionId is required." });
+    }
+    if (!stripe) {
+      return res.status(503).json({ success: false, error: "Stripe is not configured." });
+    }
+
+    try {
+      const session = await stripe.checkout.sessions.retrieve(sessionId);
+      const isPaid = session.payment_status === "paid" || session.status === "complete";
+
+      if (!isPaid) {
+        return res.json({ success: false, error: "Checkout session is not paid yet.", status: session.status });
+      }
+
+      const email = (
+        session.customer_email ||
+        session.customer_details?.email ||
+        session.metadata?.email ||
+        ""
+      ).toLowerCase().trim();
+
+      if (!email) {
+        return res.status(400).json({ success: false, error: "No customer email found on checkout session." });
+      }
+
+      const subscription = activateSubscription(
+        email,
+        typeof session.subscription === "string" ? session.subscription : undefined
+      );
+
+      res.json({ success: true, subscription });
+    } catch (err: any) {
+      console.error("[Billing] confirm-session error:", err);
+      res.status(500).json({ success: false, error: err.message });
+    }
+  });
+
+  app.post("/api/stripe/sync-subscription", async (req, res) => {
+    const { email } = req.body || {};
+    const targetEmail = (email || "").toLowerCase().trim();
+
+    if (!targetEmail) {
+      return res.status(400).json({ success: false, error: "A valid billing email is required." });
+    }
+
+    const stripe = getStripe();
+    if (!stripe) {
+      return res.status(503).json({ success: false, error: "Stripe is not configured." });
+    }
+
+    try {
+      const customers = await stripe.customers.list({ email: targetEmail, limit: 5 });
+      if (customers.data.length === 0) {
+        return res.json({
+          success: false,
+          error: "No Stripe customer found for this email. Use the same email as checkout.",
+        });
+      }
+
+      const subscription = await syncSubscriptionFromStripe(targetEmail);
+      if (subscription) {
+        return res.json({ success: true, subscription, source: "stripe-sync" });
+      }
+
+      res.json({
+        success: false,
+        error: "No active Stripe subscription found for this email.",
+      });
+    } catch (err: any) {
+      console.error("[Billing] sync-subscription error:", err);
+      res.status(500).json({ success: false, error: err.message });
+    }
+  });
+
+  app.get("/api/stripe/webhook-logs", requireAdminKey, (req, res) => {
     res.json({ logs: webhookLogs });
   });
 
   app.post("/api/stripe/checkout", async (req, res) => {
     const { email, successUrl, cancelUrl } = req.body;
-    const targetEmail = (email || "rcsequeira@google.com").toLowerCase().trim();
+    const targetEmail = (email || "").toLowerCase().trim();
+    if (!targetEmail) {
+      return res.status(400).json({ success: false, error: "A valid billing email is required." });
+    }
     const stripe = getStripe();
+    const origin = typeof req.headers.origin === "string" ? req.headers.origin : (process.env.APP_URL || "http://localhost:3000");
+    const safeSuccessUrl = sanitizeRedirectUrl(successUrl, origin);
+    const safeCancelUrl = sanitizeRedirectUrl(cancelUrl, origin);
 
     if (stripe) {
       try {
@@ -404,27 +872,49 @@ LIMIT 50;
           ],
           mode: "subscription",
           customer_email: targetEmail,
-          success_url: successUrl || `${req.headers.origin}/?stripe=success&email=${encodeURIComponent(targetEmail)}`,
-          cancel_url: cancelUrl || `${req.headers.origin}/?stripe=cancel`,
+          metadata: { email: targetEmail },
+          success_url: (() => {
+            const url = new URL(safeSuccessUrl);
+            url.searchParams.set("stripe", "success");
+            url.searchParams.set("email", targetEmail);
+            url.searchParams.set("session_id", "{CHECKOUT_SESSION_ID}");
+            return url.toString();
+          })(),
+          cancel_url: (() => {
+            const url = new URL(safeCancelUrl);
+            url.searchParams.set("stripe", "cancel");
+            return url.toString();
+          })(),
         });
         res.json({ success: true, url: session.url, mode: "real" });
       } catch (err: any) {
         res.status(500).json({ success: false, error: err.message });
       }
     } else {
-      // Return local sandbox checkout URL redirect
       const mockSessionId = "cs_test_" + Math.random().toString(36).substring(2, 10);
+      const mockUrl = new URL(safeSuccessUrl);
+      mockUrl.searchParams.set("stripe_mock_session", mockSessionId);
+      mockUrl.searchParams.set("email", targetEmail);
       res.json({
         success: true,
-        url: `${req.headers.origin}/?stripe_mock_session=${mockSessionId}&email=${encodeURIComponent(targetEmail)}`,
+        url: mockUrl.toString(),
         mode: "simulated"
       });
     }
   });
 
   app.post("/api/stripe/simulate-webhook", (req, res) => {
+    if (isProduction) {
+      return res.status(403).json({
+        success: false,
+        error: "Webhook simulation is disabled in production.",
+      });
+    }
     const { type, email } = req.body;
-    const targetEmail = (email || "rcsequeira@google.com").toLowerCase().trim();
+    const targetEmail = (email || "").toLowerCase().trim();
+    if (!targetEmail) {
+      return res.status(400).json({ success: false, error: "A valid billing email is required." });
+    }
     const logId = "whl_sim_" + Math.random().toString(36).substring(2, 10);
     
     let mockPayload: any = {};
@@ -448,12 +938,7 @@ LIMIT 50;
         }
       };
       
-      subscriptions.set(targetEmail, {
-        status: "active",
-        email: targetEmail,
-        currentPeriodEnd: Date.now() + 30 * 24 * 60 * 60 * 1000,
-        subscriptionId: mockPayload.data.object.subscription
-      });
+      activateSubscription(targetEmail, mockPayload.data.object.subscription);
     } else if (type === "customer.subscription.deleted") {
       mockPayload = {
         id: "evt_mock_" + Math.random().toString(36).substring(2, 10),
@@ -485,6 +970,7 @@ LIMIT 50;
           currentPeriodEnd: Date.now()
         });
       }
+      persistSubscriptionsToDisk();
     }
     
     webhookLogs.unshift({
@@ -511,7 +997,7 @@ LIMIT 50;
     });
   });
 
-  app.get("/api/rooms", (req, res) => {
+  app.get("/api/rooms", requireAdminKey, (req, res) => {
     const list = Array.from(rooms.entries()).map(([code, data]) => ({
       roomCode: code,
       clientsCount: data.clientSocketIds.length,
@@ -521,11 +1007,11 @@ LIMIT 50;
   });
 
   // Completed sessions endpoints (Phase 5)
-  app.get("/api/sessions", (req, res) => {
+  app.get("/api/sessions", requireAdminKey, (req, res) => {
     res.json({ success: true, sessions: completedSessions });
   });
 
-  app.delete("/api/sessions/:id", (req, res) => {
+  app.delete("/api/sessions/:id", requireAdminKey, (req, res) => {
     const { id } = req.params;
     const idx = completedSessions.findIndex(s => s.id === id);
     if (idx >= 0) {
@@ -536,7 +1022,7 @@ LIMIT 50;
     }
   });
 
-  app.post("/api/sessions/clear", (req, res) => {
+  app.post("/api/sessions/clear", requireAdminKey, (req, res) => {
     completedSessions.length = 0;
     res.json({ success: true, message: "All sessions cleared successfully." });
   });
@@ -553,13 +1039,42 @@ LIMIT 50;
     }
   }, 15 * 60 * 1000);
 
-  // Helper to generate unique 6-digit code
   function generateRoomCode(): string {
     let code = "";
     do {
-      code = Math.floor(100000 + Math.random() * 900000).toString();
+      code = generateSecureRoomCode();
     } while (rooms.has(code));
     return code;
+  }
+
+  function getClientIp(socket: any): string {
+    return socket.handshake.headers["x-forwarded-for"]?.split(",")[0]?.trim()
+      || socket.handshake.address
+      || "unknown";
+  }
+
+  function canAttemptRoomJoin(ip: string): boolean {
+    const now = Date.now();
+    const entry = joinAttemptsByIp.get(ip);
+    if (!entry || now > entry.resetAt) {
+      joinAttemptsByIp.set(ip, { count: 1, resetAt: now + LIMITS.ROOM_JOIN_WINDOW_MS });
+      return true;
+    }
+    entry.count += 1;
+    return entry.count <= LIMITS.ROOM_JOIN_ATTEMPTS_PER_IP;
+  }
+
+  function canRequestAi(socketId: string): boolean {
+    const now = Date.now();
+    const windowStart = now - 60_000;
+    const timestamps = (aiRequestTimestamps.get(socketId) || []).filter((t) => t > windowStart);
+    if (timestamps.length >= LIMITS.AI_REQUESTS_PER_MINUTE) {
+      aiRequestTimestamps.set(socketId, timestamps);
+      return false;
+    }
+    timestamps.push(now);
+    aiRequestTimestamps.set(socketId, timestamps);
+    return true;
   }
 
   // Socket.io handlers
@@ -571,21 +1086,33 @@ LIMIT 50;
       socket.emit("heartbeat-ack", { time: Date.now() });
     });
 
-    // 1. Create Room (Host / Windows Client / Desktop Simulator)
-    // Supports both the modern `(payload, callback)` and legacy `(callback)` signatures.
-    socket.on("create-room", (arg1, arg2) => {
-      const callback = typeof arg1 === "function" ? arg1 : arg2;
-      const payload = (typeof arg1 === "function" ? {} : arg1) || {};
+    // 1. Create Room (Host — Android app or web dashboard; requires active subscription)
+    socket.on("create-room", async (payload, callback) => {
       try {
-        // Server-side paywall enforcement: the client UI gate can be bypassed by
-        // emitting this event directly, so we re-verify the subscription here.
-        const email = typeof payload.email === "string" ? payload.email.toLowerCase().trim() : "";
-        const sub = email ? subscriptions.get(email) : undefined;
-        if (!sub || sub.status !== "active") {
-          if (callback) callback({
-            success: false,
-            error: "An active Platinum subscription is required to generate a pairing room."
-          });
+        let email = "";
+        let cb: ((response: unknown) => void) | undefined = callback;
+        if (typeof payload === "function") {
+          cb = payload as (response: unknown) => void;
+        } else if (payload && typeof payload === "object") {
+          email = String((payload as { email?: string }).email || "").toLowerCase().trim();
+          cb = callback;
+        }
+
+        if (!email) {
+          if (cb) cb({ success: false, error: "Billing email is required to start pairing." });
+          return;
+        }
+        if (!hasActiveSubscription(email)) {
+          await syncSubscriptionFromStripe(email);
+        }
+        if (!hasActiveSubscription(email)) {
+          if (cb) {
+            cb({
+              success: false,
+              error: `Active €${SUBSCRIPTION_PRICE_EUR}/month subscription required. Subscribe on the website, then tap Refresh from Stripe.`,
+              code: "SUBSCRIPTION_REQUIRED",
+            });
+          }
           return;
         }
 
@@ -594,13 +1121,14 @@ LIMIT 50;
           hostSocketId: socket.id,
           clientSocketIds: [],
           created: Date.now(),
-          history: []
+          ownerEmail: email,
+          history: [],
         });
         socketToRoom.set(socket.id, code);
         socket.join(`room-${code}`);
 
-        console.log(`Room created: ${code} by host ${socket.id}`);
-        if (callback) callback({ success: true, roomCode: code });
+        console.log(`Room created: ${code} by host ${socket.id} (${email})`);
+        if (cb) cb({ success: true, roomCode: code, ownerEmail: email });
       } catch (err: any) {
         console.error("Error creating room:", err);
         if (callback) callback({ success: false, error: err.message });
@@ -610,9 +1138,14 @@ LIMIT 50;
     // 2. Join Room (Mobile / Assistant Client)
     socket.on("join-room", (payload, callback) => {
       try {
-        const roomCode = payload && typeof payload.roomCode === "string" ? payload.roomCode.trim() : "";
-        if (!roomCode) {
-          if (callback) callback({ success: false, error: "Room code required" });
+        const { roomCode } = payload || {};
+        if (!isValidRoomCode(roomCode)) {
+          if (callback) callback({ success: false, error: "Valid 6-digit room code required" });
+          return;
+        }
+
+        if (!canAttemptRoomJoin(getClientIp(socket))) {
+          if (callback) callback({ success: false, error: "Too many join attempts. Try again later." });
           return;
         }
 
@@ -622,10 +1155,20 @@ LIMIT 50;
           return;
         }
 
-        // Add client to room (dedupe to avoid inflated client counts on re-join)
-        if (!room.clientSocketIds.includes(socket.id)) {
-          room.clientSocketIds.push(socket.id);
+        const subscriptionError = requireActiveSubscriptionForRoom(room);
+        if (subscriptionError) {
+          if (callback) {
+            callback({
+              success: false,
+              error: subscriptionError,
+              code: "SUBSCRIPTION_REQUIRED",
+            });
+          }
+          return;
         }
+
+        // Add client to room
+        room.clientSocketIds.push(socket.id);
         socketToRoom.set(socket.id, roomCode);
         socket.join(`room-${roomCode}`);
 
@@ -652,15 +1195,46 @@ LIMIT 50;
     });
 
     // 3. Real-time Stream forwarding (Screenshots, Audio Chunks, Context payload)
-    socket.on("stream-data", (payload) => {
+    socket.on("stream-data", async (payload) => {
       const roomCode = socketToRoom.get(socket.id);
       if (!roomCode) return;
 
-      // Broadcast screenshots / raw telemetry to other clients in the same room (e.g. mobile display)
-      socket.to(`room-${roomCode}`).emit("stream-feed", payload);
+      const room = rooms.get(roomCode);
+      if (!room) return;
+
+      if (payload?.image && estimateBase64Bytes(String(payload.image)) > LIMITS.MAX_IMAGE_BYTES) {
+        socket.emit("stream-error", { error: "Image payload exceeds 5MB limit." });
+        return;
+      }
+
+      let forwardPayload = { ...payload };
+
+      if (payload?.audioBase64 && hasActiveSubscription(room.ownerEmail) && aiClient) {
+        try {
+          const raw = String(payload.audioBase64).includes("base64,")
+            ? String(payload.audioBase64).split("base64,")[1]
+            : String(payload.audioBase64);
+          if (estimateBase64Bytes(raw) <= LIMITS.MAX_AUDIO_BYTES) {
+            const geminiModel = process.env.GEMINI_MODEL || "gemini-2.5-flash";
+            const result = await aiClient.models.generateContent({
+              model: geminiModel,
+              contents: [
+                { inlineData: { mimeType: payload.audioMimeType || "audio/wav", data: raw } },
+                { text: "Transcribe spoken interview content. Return only the transcript." },
+              ],
+            });
+            const transcript = (result.text || "").trim();
+            if (transcript) forwardPayload.audioTranscript = transcript;
+          }
+        } catch (err: any) {
+          console.warn("[Stream] Audio transcribe skipped:", err.message);
+        }
+        delete forwardPayload.audioBase64;
+      }
+
+      io.to(`room-${roomCode}`).emit("stream-feed", forwardPayload);
     });
 
-    // 4. Request Real-Time Interview Optimization suggestion (Gemini AI prompt)
     socket.on("request-ai-assist", async (payload) => {
       const roomCode = socketToRoom.get(socket.id);
       if (!roomCode) {
@@ -668,40 +1242,106 @@ LIMIT 50;
         return;
       }
 
+      const roomForSub = rooms.get(roomCode);
+      const subscriptionError = requireActiveSubscriptionForRoom(roomForSub);
+      if (subscriptionError) {
+        socket.emit("ai-error", { error: subscriptionError, code: "SUBSCRIPTION_REQUIRED" });
+        return;
+      }
+
+      if (!canRequestAi(socket.id)) {
+        socket.emit("ai-error", { error: "Rate limit exceeded. Wait before requesting another suggestion." });
+        return;
+      }
+
       const room = rooms.get(roomCode);
       if (!room) return;
 
-      const { prompt, image, audioTranscript, scenario } = payload || {};
-      if (scenario) {
-        room.scenario = scenario;
+      if (room.aiInProgress) {
+        socket.emit("ai-error", { error: "A suggestion is already being generated for this room." });
+        return;
       }
+
+      room.aiInProgress = true;
+
+      const { prompt, image, audioTranscript, scenario, interviewProfile, screenContext } = payload || {};
+      if (typeof prompt === "string" && prompt.length > LIMITS.MAX_PROMPT_CHARS) {
+        room.aiInProgress = false;
+        socket.emit("ai-error", { error: "Prompt exceeds maximum length." });
+        return;
+      }
+      if (typeof audioTranscript === "string" && audioTranscript.length > LIMITS.MAX_TRANSCRIPT_CHARS) {
+        room.aiInProgress = false;
+        socket.emit("ai-error", { error: "Transcript exceeds maximum length." });
+        return;
+      }
+      if (typeof screenContext === "string" && screenContext.length > LIMITS.MAX_SCREEN_CONTEXT_CHARS) {
+        room.aiInProgress = false;
+        socket.emit("ai-error", { error: "Screen context exceeds maximum length." });
+        return;
+      }
+      if (interviewProfile && typeof interviewProfile === "object") {
+        room.profile = {
+          targetPosition: String(interviewProfile.targetPosition || "").slice(0, 200),
+          company: String(interviewProfile.company || "").slice(0, 100),
+          jobDescription: String(interviewProfile.jobDescription || "").slice(0, LIMITS.MAX_JOB_DESCRIPTION_CHARS),
+          userCv: String(interviewProfile.userCv || "").slice(0, LIMITS.MAX_CV_CHARS),
+          specialInstructions: String(interviewProfile.specialInstructions || "").slice(0, LIMITS.MAX_SPECIAL_INSTRUCTIONS_CHARS),
+        };
+        room.scenario = {
+          title: room.profile.targetPosition || "Interview Session",
+          company: room.profile.company || "Target Company",
+          role: room.profile.targetPosition || "Candidate",
+        };
+      } else if (scenario && typeof scenario === "object") {
+        room.scenario = {
+          title: String(scenario.title || "").slice(0, 200),
+          company: String(scenario.company || "").slice(0, 100),
+          role: String(scenario.role || "").slice(0, 100),
+        };
+      }
+      if (image && isLikelyBase64Image(String(image)) && estimateBase64Bytes(String(image)) > LIMITS.MAX_IMAGE_BYTES) {
+        room.aiInProgress = false;
+        socket.emit("ai-error", { error: "Image payload exceeds 5MB limit." });
+        return;
+      }
+
+      if (interviewProfile?.targetPosition && typeof interviewProfile.jobDescription === "string" && interviewProfile.jobDescription.length > LIMITS.MAX_JOB_DESCRIPTION_CHARS) {
+        room.aiInProgress = false;
+        socket.emit("ai-error", { error: "Job description exceeds maximum length." });
+        return;
+      }
+      if (interviewProfile?.userCv && typeof interviewProfile.userCv === "string" && interviewProfile.userCv.length > LIMITS.MAX_CV_CHARS) {
+        room.aiInProgress = false;
+        socket.emit("ai-error", { error: "CV exceeds maximum length." });
+        return;
+      }
+      if (image && !isLikelyBase64Image(String(image)) && estimateBase64Bytes(String(image)) > LIMITS.MAX_IMAGE_BYTES) {
+        room.aiInProgress = false;
+        socket.emit("ai-error", { error: "Image payload exceeds 5MB limit." });
+        return;
+      }
+
       console.log(`Generating optimization suggestion for room ${roomCode}...`);
 
-      // Inform room that suggestion generation started (shows beautiful animated loading spinner)
       io.to(`room-${roomCode}`).emit("ai-start");
 
-      const systemInstruction = `You are "The Interview Helper", an elite real-time technical interview optimization expert. 
-Your target is to help the candidate by analyzing their screen (screenshots of code/question text) and the interviewer's spoken words (audio transcript).
-Deliver an ultra-optimized, condensed cheat-sheet in standard Markdown that the candidate can scan in 3-5 seconds.
-Always structure your output with these specific, scan-friendly sections:
-- **🎯 IDENTIFIED CHALLENGE**: Name of the algorithm, question, or technology concept being discussed.
-- **💡 OPTIMAL STRATEGY**: 2-3 bullet points detailing the best Time/Space complexity, data structures, and edge cases to mention.
-- **💻 GOLDEN CODE**: An ultra-clean, minimal code snippet (Typescript/Javascript/Python as appropriate) implementing the core logic of the optimal solution.
-- **🗣️ TALKING POINTS**: 2 quick bullet points of phrasing or wording to use (e.g., "Mention how we can optimize this from O(N^2) using a Hash Map...").
-
-Do not include greetings, explanations of code details, or long intros. Speed is everything. Keep the total length short and easy to read.`;
+      const systemInstruction = buildPersonalizedSystemInstruction(room.profile || interviewProfile);
 
       // Build Gemini contents
       let aiResponseStream = null;
       let completedText = "";
+      const geminiModel = process.env.GEMINI_MODEL || "gemini-2.5-flash";
 
+      try {
       if (aiClient) {
         try {
           const contents: any[] = [];
-          
-          if (image) {
-            // Check if base64 contains metadata prefix, strip it if so
-            const base64Data = image.includes("base64,") ? image.split("base64,")[1] : image;
+          const screenText = String(screenContext || "").trim();
+          const imageValue = String(image || "").trim();
+
+          if (imageValue && isLikelyBase64Image(imageValue)) {
+            const base64Data = imageValue.includes("base64,") ? imageValue.split("base64,")[1] : imageValue;
             contents.push({
               inlineData: {
                 data: base64Data,
@@ -710,41 +1350,44 @@ Do not include greetings, explanations of code details, or long intros. Speed is
             });
           }
 
-          let promptText = "Review the active interview state and suggest the optimal next steps.";
+          let promptText = "Review the active interview state and suggest the optimal next steps for this candidate.";
+          if (room.profile?.targetPosition) {
+            promptText += `\nTarget role: ${room.profile.targetPosition}`;
+          }
+          if (screenText) {
+            promptText += `\n\nScreen / code / question content:\n${screenText.slice(0, LIMITS.MAX_SCREEN_CONTEXT_CHARS)}`;
+          } else if (imageValue && !isLikelyBase64Image(imageValue)) {
+            promptText += `\n\nScreen / code / question content:\n${imageValue.slice(0, LIMITS.MAX_SCREEN_CONTEXT_CHARS)}`;
+          }
           if (audioTranscript) {
-            promptText += `\nInterviewer spoken content (Transcript): "${audioTranscript}"`;
+            promptText += `\n\nInterviewer spoken content (Transcript): "${String(audioTranscript).slice(0, LIMITS.MAX_TRANSCRIPT_CHARS)}"`;
           }
           if (prompt) {
-            promptText += `\nDirect Candidate request: "${prompt}"`;
+            promptText += `\n\nDirect candidate request: "${String(prompt).slice(0, LIMITS.MAX_PROMPT_CHARS)}"`;
           }
           contents.push({ text: promptText });
 
-          // Call the modern streaming SDK. Model is configurable so operators can
-          // point at a different Gemini variant without code changes.
           aiResponseStream = await aiClient.models.generateContentStream({
-            model: process.env.GEMINI_MODEL || "gemini-3.5-flash",
+            model: geminiModel,
             contents,
             config: {
               systemInstruction,
-              temperature: 0.2, // low temperature for highly deterministic/correct coding answers
+              temperature: 0.2,
             }
           });
 
           for await (const chunk of aiResponseStream) {
             const text = chunk.text || "";
             completedText += text;
-            // Emit real-time word chunks back to room
             io.to(`room-${roomCode}`).emit("ai-chunk", { text });
           }
 
-          // Save suggestion to history
           room.history.push({
             role: "assistant",
             content: completedText,
             timestamp: new Date().toLocaleTimeString()
           });
 
-          // Update active session records (Phase 5)
           saveOrUpdateSession(roomCode, room, false);
 
           io.to(`room-${roomCode}`).emit("ai-end", { fullText: completedText });
@@ -752,19 +1395,14 @@ Do not include greetings, explanations of code details, or long intros. Speed is
 
         } catch (err: any) {
           console.error("Gemini API stream error:", err);
-          // Degrade gracefully: fall back to high-fidelity simulation instead of
-          // surfacing a hard error to the paired clients. Only report an error if
-          // the fallback itself fails, so a single suggestion is always delivered.
-          try {
-            await runSimulationFallback(roomCode, room, prompt, audioTranscript);
-          } catch (fallbackErr: any) {
-            console.error("Simulation fallback error:", fallbackErr);
-            io.to(`room-${roomCode}`).emit("ai-error", { error: "Suggestion engine temporarily unavailable. Please retry." });
-          }
+          io.to(`room-${roomCode}`).emit("ai-error", { error: "Gemini API error: " + err.message });
+          await runSimulationFallback(roomCode, room, prompt, audioTranscript);
         }
       } else {
-        // Fallback simulation when no API key is specified
         await runSimulationFallback(roomCode, room, prompt, audioTranscript);
+      }
+      } finally {
+        room.aiInProgress = false;
       }
     });
 
@@ -801,6 +1439,7 @@ Do not include greetings, explanations of code details, or long intros. Speed is
         }
         socketToRoom.delete(socket.id);
       }
+      aiRequestTimestamps.delete(socket.id);
     });
   });
 
@@ -964,19 +1603,53 @@ function streamState(screenshotBase64: string, transcript: string) {
     console.log(`Simulated stream successfully completed for room ${roomCode}.`);
   }
 
-  // Vite development integration
-  if (process.env.NODE_ENV !== "production") {
+  // Vite development integration (local dev only — production bundle serves /dist)
+  if (!isProduction) {
     console.log("Starting development mode with Vite HMR middleware...");
+    app.use("/downloads", express.static(path.join(process.cwd(), "public", "downloads"), {
+      setHeaders(res, filePath) {
+        const name = path.basename(filePath);
+        const contentType = downloadContentType(filePath);
+        if (contentType) {
+          res.setHeader("Content-Type", contentType);
+        }
+        if (name.endsWith(".apk") || name.endsWith(".exe") || name.endsWith(".zip")) {
+          res.setHeader("Content-Disposition", `attachment; filename="${name}"`);
+        }
+      },
+    }));
     const vite = await createViteServer({
-      server: { middlewareMode: true },
+      server: {
+        middlewareMode: true,
+        allowedHosts: [".railway.app", "theinterviewhelper.com", "www.theinterviewhelper.com", "localhost"],
+      },
       appType: "spa"
     });
     app.use(vite.middlewares);
   } else {
     console.log("Serving static production assets from /dist...");
     const distPath = path.join(process.cwd(), "dist");
+    if (!fs.existsSync(path.join(distPath, "index.html"))) {
+      console.error("Production build missing: dist/index.html not found. Run npm run build.");
+      process.exit(1);
+    }
     app.use(express.static(distPath));
-    app.get("*", (req, res) => {
+    app.use("/downloads", express.static(path.join(process.cwd(), "public", "downloads"), {
+      setHeaders(res, filePath) {
+        const name = path.basename(filePath);
+        const contentType = downloadContentType(filePath);
+        if (contentType) {
+          res.setHeader("Content-Type", contentType);
+        }
+        if (name.endsWith(".apk") || name.endsWith(".exe") || name.endsWith(".zip")) {
+          res.setHeader("Content-Disposition", `attachment; filename="${name}"`);
+        }
+      },
+    }));
+    app.get("*", (req, res, next) => {
+      if (req.path.startsWith("/api/")) {
+        return next();
+      }
       res.sendFile(path.join(distPath, "index.html"));
     });
   }

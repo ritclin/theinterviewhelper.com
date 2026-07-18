@@ -13,9 +13,35 @@ import {
   TrendingUp, Search, FileText, Copy, Check, Database, Activity, Download,
   History
 } from "lucide-react";
-import { INTERVIEW_SCENARIOS } from "./scenarios";
-import { InterviewScenario, SuggestionHistoryItem } from "./types";
+import { SuggestionHistoryItem, InterviewProfile } from "./types";
 import { MarkdownStreamViewer } from "./components/MarkdownStreamViewer";
+import { InterviewProfileForm } from "./components/InterviewProfileForm";
+
+const EMPTY_PROFILE: InterviewProfile = {
+  targetPosition: "",
+  company: "",
+  jobDescription: "",
+  userCv: "",
+  specialInstructions: "",
+};
+
+function loadSavedProfile(): InterviewProfile {
+  if (typeof window === "undefined") return EMPTY_PROFILE;
+  try {
+    const raw = localStorage.getItem("tih_interview_profile");
+    if (!raw) return EMPTY_PROFILE;
+    const parsed = JSON.parse(raw);
+    return {
+      targetPosition: parsed.targetPosition || "",
+      company: parsed.company || "",
+      jobDescription: parsed.jobDescription || "",
+      userCv: parsed.userCv || "",
+      specialInstructions: parsed.specialInstructions || "",
+    };
+  } catch {
+    return EMPTY_PROFILE;
+  }
+}
 
 export default function App() {
   // Global Socket reference
@@ -29,13 +55,13 @@ export default function App() {
   const [activeRelayRooms, setActiveRelayRooms] = useState<any[]>([]);
 
   // SaaS Billing and Stripe States
-  const [userEmail, setUserEmail] = useState<string>("rcsequeira@google.com");
+  const [userEmail, setUserEmail] = useState<string>("");
   const [subscription, setSubscription] = useState<{
     status: "active" | "canceled" | "none";
     email: string;
     currentPeriodEnd: number;
     subscriptionId?: string;
-  }>({ status: "none", email: "rcsequeira@google.com", currentPeriodEnd: 0 });
+  }>({ status: "none", email: "", currentPeriodEnd: 0 });
   const [webhookLogs, setWebhookLogs] = useState<any[]>([]);
   const [loadingSub, setLoadingSub] = useState(false);
   const [showCheckoutModal, setShowCheckoutModal] = useState(false);
@@ -44,7 +70,9 @@ export default function App() {
   // Panel A: Host Client Simulator State
   const [hostRoomCode, setHostRoomCode] = useState<string>("");
   const [hostPaired, setHostPaired] = useState(false);
-  const [selectedScenario, setSelectedScenario] = useState<InterviewScenario>(INTERVIEW_SCENARIOS[0]);
+  const [interviewProfile, setInterviewProfile] = useState<InterviewProfile>(loadSavedProfile);
+  const [liveTranscript, setLiveTranscript] = useState("");
+  const [screenContext, setScreenContext] = useState("");
   const [customPrompt, setCustomPrompt] = useState("");
   const [isStreamingFeed, setIsStreamingFeed] = useState(false);
 
@@ -93,18 +121,40 @@ export default function App() {
 
   // Fetch subscription status
   const fetchSubscription = async (email: string) => {
+    if (!email.trim()) return;
     setLoadingSub(true);
     try {
       const res = await fetch(`/api/stripe/status?email=${encodeURIComponent(email)}`);
       if (res.ok) {
         const data = await res.json();
         setSubscription(data);
+        return data;
       }
     } catch (err) {
       console.warn("Failed to fetch subscription status:", err);
     } finally {
       setLoadingSub(false);
     }
+    return null;
+  };
+
+  const syncSubscriptionFromStripe = async (email: string): Promise<boolean> => {
+    if (!email.trim()) return false;
+    try {
+      const res = await fetch("/api/stripe/sync-subscription", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ email: email.trim() }),
+      });
+      const data = await res.json();
+      if (data.success && data.subscription) {
+        setSubscription(data.subscription);
+        return true;
+      }
+    } catch (err) {
+      console.warn("Failed to sync subscription from Stripe:", err);
+    }
+    return false;
   };
 
   // Fetch webhook logs
@@ -143,6 +193,10 @@ export default function App() {
 
   // Initiate mock/real Stripe checkout
   const handleStripeCheckout = async () => {
+    if (!userEmail.trim()) {
+      alert("Please enter your billing email before subscribing.");
+      return;
+    }
     try {
       const res = await fetch("/api/stripe/checkout", {
         method: "POST",
@@ -191,24 +245,73 @@ export default function App() {
     }
   };
 
+  useEffect(() => {
+    localStorage.setItem("tih_interview_profile", JSON.stringify(interviewProfile));
+  }, [interviewProfile]);
+
+  // After Stripe Checkout redirect — activate subscription immediately
+  useEffect(() => {
+    const params = new URLSearchParams(window.location.search);
+    if (params.get("stripe") !== "success") return;
+
+    const emailFromStripe = (params.get("email") || "").trim();
+    const sessionId = params.get("session_id") || "";
+
+    const finalizePayment = async () => {
+      if (emailFromStripe) {
+        setUserEmail(emailFromStripe);
+      }
+
+      if (sessionId) {
+        try {
+          const res = await fetch("/api/stripe/confirm-session", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ sessionId }),
+          });
+          const data = await res.json();
+          if (data.success && data.subscription) {
+            setSubscription(data.subscription);
+          }
+        } catch (err) {
+          console.warn("Failed to confirm Stripe checkout session:", err);
+        }
+      }
+
+      if (emailFromStripe) {
+        const status = await fetchSubscription(emailFromStripe);
+        if (status?.status !== "active") {
+          await syncSubscriptionFromStripe(emailFromStripe);
+        }
+      }
+
+      window.history.replaceState({}, "", window.location.pathname);
+    };
+
+    finalizePayment();
+  }, []);
+
   // Load subscription status and webhooks on load and whenever email changes
   useEffect(() => {
+    if (!userEmail) return;
     fetchSubscription(userEmail);
     fetchWebhookLogs();
     fetchSessions();
     
-    // Set up polling for webhook logs and active sessions every 5 seconds
     const pollInterval = setInterval(() => {
-      fetchWebhookLogs();
-      fetchStats();
-      fetchSessions();
-    }, 5000);
+      if (document.visibilityState === "visible") {
+        fetchWebhookLogs();
+        fetchStats();
+        if (activeSaaSTab === "history") {
+          fetchSessions();
+        }
+      }
+    }, 15000);
 
     return () => clearInterval(pollInterval);
-  }, [userEmail]);
+  }, [userEmail, activeSaaSTab]);
 
   useEffect(() => {
-    // 1. Initialize Socket.io Connection to current origin
     const socket = io(window.location.origin, {
       transports: ["websocket", "polling"],
       reconnectionAttempts: 10,
@@ -216,27 +319,31 @@ export default function App() {
     });
 
     socketRef.current = socket;
+    let pendingPingAt: number | null = null;
 
     socket.on("connect", () => {
       setSocketConnected(true);
       fetchStats();
       console.log("Socket client successfully linked:", socket.id);
       
-      // Setup latency ping-pong
       pingIntervalRef.current = setInterval(() => {
-        const start = Date.now();
+        pendingPingAt = Date.now();
         socket.emit("heartbeat");
-        socket.once("heartbeat-ack", () => {
-          const latency = Date.now() - start;
-          setPingLatency(latency);
-          setLatencyHistory(prev => {
-            const timeStr = new Date().toLocaleTimeString().split(" ")[0];
-            const next = [...prev, { time: timeStr, latency }];
-            if (next.length > 15) next.shift();
-            return next;
-          });
-        });
       }, 5000);
+    });
+
+    socket.on("heartbeat-ack", () => {
+      if (pendingPingAt !== null) {
+        const latency = Date.now() - pendingPingAt;
+        setPingLatency(latency);
+        pendingPingAt = null;
+        setLatencyHistory(prev => {
+          const timeStr = new Date().toLocaleTimeString().split(" ")[0];
+          const next = [...prev, { time: timeStr, latency }];
+          if (next.length > 15) next.shift();
+          return next;
+        });
+      }
     });
 
     socket.on("disconnect", () => {
@@ -321,22 +428,30 @@ export default function App() {
       socket.disconnect();
       if (pingIntervalRef.current) clearInterval(pingIntervalRef.current);
     };
-  }, [hostRoomCode, clientJoinedCode]);
+  }, []);
 
   // 1. Host create room action
-  const handleCreateRoom = () => {
+  const handleCreateRoom = async () => {
     if (!socketRef.current || !socketConnected) {
       alert("Socket is currently offline. Please wait for server link.");
       return;
     }
 
-    if (subscription.status !== "active") {
-      alert("🔒 PLATINUM SUBSCRIPTION REQUIRED\n\nTo generate new pairing rooms and use the companion overlays, please activate your €20/mo subscription. Opening Stripe Checkout simulator!");
-      setShowCheckoutModal(true);
+    if (!userEmail.trim()) {
+      alert("Please enter your billing email in the SaaS Subscriber field before creating a room.");
       return;
     }
 
-    socketRef.current.emit("create-room", { email: userEmail }, (response: any) => {
+    if (subscription.status !== "active") {
+      const synced = await syncSubscriptionFromStripe(userEmail.trim());
+      if (!synced) {
+        alert("🔒 PLATINUM SUBSCRIPTION REQUIRED\n\nNo active subscription found for this email. Subscribe with the same email you enter here, or click Refresh below if you already paid.");
+        setShowCheckoutModal(true);
+        return;
+      }
+    }
+
+    socketRef.current.emit("create-room", { email: userEmail.trim().toLowerCase() }, (response: any) => {
       if (response.success) {
         setHostRoomCode(response.roomCode);
         setHostPaired(false);
@@ -344,6 +459,9 @@ export default function App() {
         setInputRoomCode(response.roomCode);
         fetchStats();
       } else {
+        if (response.code === "SUBSCRIPTION_REQUIRED") {
+          setShowCheckoutModal(true);
+        }
         alert(`Error generating room code: ${response.error}`);
       }
     });
@@ -382,9 +500,9 @@ export default function App() {
 
     setIsStreamingFeed(true);
     socketRef.current.emit("stream-data", {
-      imageText: selectedScenario.mockImageText,
-      imageName: selectedScenario.imageName,
-      audioTranscript: selectedScenario.transcript,
+      imageText: screenContext,
+      imageName: interviewProfile.targetPosition || "Interview screen",
+      audioTranscript: liveTranscript,
       timestamp: Date.now()
     });
 
@@ -393,22 +511,27 @@ export default function App() {
     }, 1200);
   };
 
-  // 4. Simulates Ctrl+Shift+Space Hotkey -> Triggers AI reasoning cycle on the Relay
   const handleTriggerAIEngine = () => {
     if (!socketRef.current || !hostRoomCode) {
       alert("Please generate a Room Code first.");
       return;
     }
 
+    if (!interviewProfile.targetPosition.trim()) {
+      alert("Please enter the position you are interviewing for in Your Interview Profile.");
+      return;
+    }
+
+    if (!liveTranscript.trim() && !screenContext.trim() && !customPrompt.trim()) {
+      alert("Add the interviewer's question, screen content, or a manual ask before triggering AI.");
+      return;
+    }
+
     socketRef.current.emit("request-ai-assist", {
       prompt: customPrompt || undefined,
-      image: selectedScenario.mockImageText, // Sending the text code as simulated image
-      audioTranscript: selectedScenario.transcript,
-      scenario: {
-        title: selectedScenario.title,
-        company: selectedScenario.company,
-        role: selectedScenario.role
-      }
+      screenContext: screenContext || undefined,
+      audioTranscript: liveTranscript || undefined,
+      interviewProfile,
     });
 
     setCustomPrompt("");
@@ -503,19 +626,32 @@ export default function App() {
         {activeSaaSTab === "platform" && (
           <div className="flex flex-col gap-6">
             
-            {/* Introductory Platform Info (Elegant, brief, informative) */}
             <div className="bg-slate-900/30 border border-slate-900 rounded-2xl p-6 flex flex-col md:flex-row items-start md:items-center justify-between gap-4">
               <div className="max-w-xl">
-                <h2 className="text-lg font-bold font-display text-white mb-1.5">Phase 1 Integration: Active WebSocket Relay</h2>
+                <h2 className="text-lg font-bold font-display text-white mb-1.5">Personalized Interview Assistant</h2>
                 <p className="text-sm text-slate-400 leading-relaxed">
-                  This interface serves as your full SaaS platform simulation rig. Below, you can spin up the 
-                  <strong> Windows capture client (host)</strong> and the <strong> mobile assistant app (client)</strong> side-by-side. 
-                  They connect via the real Socket.io server on port 3000 to test pairing, streaming, and Gemini reasoning.
+                  Set your target role, job description, and CV below. During the interview, paste the live question and what is on your screen — AI answers will be tailored to you and the position.
                 </p>
               </div>
               <div className="px-4 py-3 rounded-xl bg-indigo-950/20 border border-indigo-900/40 text-xs text-indigo-300 font-mono">
                 Active Relay Rooms: {activeRelayRoomsCount}
               </div>
+            </div>
+
+            <InterviewProfileForm
+              profile={interviewProfile}
+              onChange={setInterviewProfile}
+              liveTranscript={liveTranscript}
+              onLiveTranscriptChange={setLiveTranscript}
+              screenContext={screenContext}
+              onScreenContextChange={setScreenContext}
+            />
+
+            <div className="bg-slate-900/20 border border-slate-900 rounded-2xl p-6">
+              <h3 className="text-sm font-bold text-white font-display mb-1">Live Platform & Pairing</h3>
+              <p className="text-xs text-slate-500 mb-0">
+                Generate a room code and connect your mobile companion for real-time suggestions.
+              </p>
             </div>
 
             {/* SaaS Subscriber Account, Billing Hub, and Live Relay Registry (Phase 4 integration) */}
@@ -536,8 +672,10 @@ export default function App() {
                           const val = e.target.value;
                           setUserEmail(val);
                         }}
-                        placeholder="email@example.com"
-                        className="bg-transparent border-b border-slate-800 text-[11px] text-slate-300 font-mono focus:border-indigo-500 focus:outline-none w-36 truncate py-0.5"
+                        placeholder="Enter your email"
+                        required
+                        autoComplete="email"
+                        className="bg-transparent border-b border-slate-800 text-[11px] text-slate-300 font-mono focus:border-indigo-500 focus:outline-none w-44 truncate py-0.5"
                       />
                     </div>
                   </div>
@@ -587,6 +725,24 @@ export default function App() {
                       >
                         <CreditCard className="w-3 h-3" />
                         Subscribe (€20/mo)
+                      </button>
+                      <button 
+                        onClick={async () => {
+                          if (!userEmail.trim()) {
+                            alert("Enter your billing email first.");
+                            return;
+                          }
+                          const synced = await syncSubscriptionFromStripe(userEmail.trim());
+                          if (synced) {
+                            alert("Subscription synced from Stripe. You can now generate room codes.");
+                          } else {
+                            alert("No active subscription found in Stripe for this email.");
+                          }
+                        }}
+                        className="w-full mt-2 py-1.5 rounded bg-slate-950 hover:bg-slate-900 text-slate-300 border border-slate-800 text-[10px] font-bold cursor-pointer transition-colors flex items-center justify-center gap-1"
+                      >
+                        <RefreshCw className="w-3 h-3" />
+                        Refresh from Stripe
                       </button>
                     </div>
                   )}
@@ -697,61 +853,22 @@ export default function App() {
                     )}
                   </div>
 
-                  {/* Scenario selection & input */}
                   {hostRoomCode && (
                     <div className="space-y-4">
-                      {/* Interview scenario dropdown */}
                       <div>
-                        <label className="block text-xs font-semibold text-slate-300 mb-1.5">SELECT INTERVIEW SCENARIO</label>
-                        <div className="grid grid-cols-1 sm:grid-cols-3 gap-2">
-                          {INTERVIEW_SCENARIOS.map((scenario) => (
-                            <button
-                              key={scenario.id}
-                              onClick={() => setSelectedScenario(scenario)}
-                              className={`p-3 rounded-lg text-left border transition-all cursor-pointer ${selectedScenario.id === scenario.id ? "bg-slate-900 border-indigo-500/70 shadow-md shadow-indigo-500/5" : "bg-slate-950/30 border-slate-900 hover:bg-slate-900/50 hover:border-slate-800"}`}
-                            >
-                              <div className="font-bold text-[11px] text-white truncate">{scenario.title}</div>
-                              <div className="text-[10px] text-slate-400 font-medium truncate mt-0.5">{scenario.company} ({scenario.role})</div>
-                            </button>
-                          ))}
-                        </div>
+                        <label className="block text-xs font-semibold text-slate-300 mb-1.5">QUICK MANUAL ASK (OPTIONAL)</label>
+                        <input 
+                          type="text" 
+                          placeholder="e.g. 'How should I answer this system design question?'"
+                          value={customPrompt}
+                          onChange={(e) => setCustomPrompt(e.target.value)}
+                          className="w-full bg-slate-950 border border-slate-900 focus:border-indigo-500 focus:ring-1 focus:ring-indigo-500 rounded-lg px-3.5 py-2 text-xs text-slate-200 placeholder-slate-600 outline-none transition-all"
+                          onKeyDown={(e) => { if (e.key === "Enter") handleTriggerAIEngine(); }}
+                        />
                       </div>
-
-                      {/* Mock Screenshot (visual preview) */}
-                      <div>
-                        <div className="flex items-center justify-between mb-1.5">
-                          <span className="text-xs font-semibold text-slate-300 uppercase tracking-wider">💻 Active Screenshot Simulation</span>
-                          <span className="text-[10px] text-indigo-400 font-mono font-bold bg-indigo-950/30 px-2 py-0.5 rounded border border-indigo-900/30">{selectedScenario.imageName}</span>
-                        </div>
-                        <div className="p-3 bg-slate-950 border border-slate-900 rounded-xl overflow-hidden max-h-[160px] relative group shadow-inner">
-                          <pre className="text-[11px] text-left text-slate-400 font-mono overflow-y-auto max-h-[140px] whitespace-pre-wrap select-none scrollbar-thin scrollbar-thumb-slate-900 scrollbar-track-transparent">
-                            {selectedScenario.mockImageText}
-                          </pre>
-                        </div>
-                      </div>
-
-                      {/* Interviewer Transcript */}
-                      <div>
-                        <span className="block text-xs font-semibold text-slate-300 uppercase tracking-wider mb-1.5">🎙️ Simulated Audio Input (Interviewer Speaking)</span>
-                        <div className="p-3 bg-slate-950/60 border border-slate-900 rounded-xl text-xs text-slate-300 italic leading-relaxed shadow-inner">
-                          "{selectedScenario.transcript}"
-                        </div>
-                      </div>
-
-                      {/* Manual Candidate Query */}
-                      <div>
-                        <label className="block text-xs font-semibold text-slate-300 mb-1.5">CANDIDATE MANUAL ASKS (OPTIONAL)</label>
-                        <div className="flex gap-2">
-                          <input 
-                            type="text" 
-                            placeholder="Type custom questions (e.g. 'explain time complexity of this', 'optimize space')"
-                            value={customPrompt}
-                            onChange={(e) => setCustomPrompt(e.target.value)}
-                            className="flex-1 bg-slate-950 border border-slate-900 focus:border-indigo-500 focus:ring-1 focus:ring-indigo-500 rounded-lg px-3.5 py-2 text-xs text-slate-200 placeholder-slate-600 outline-none transition-all"
-                            onKeyDown={(e) => { if (e.key === "Enter") handleTriggerAIEngine(); }}
-                          />
-                        </div>
-                      </div>
+                      <p className="text-[10px] text-slate-500">
+                        Profile, job description, CV, transcript, and screen content are configured in <strong className="text-slate-400">Your Interview Profile</strong> above.
+                      </p>
                     </div>
                   )}
                 </div>
@@ -937,8 +1054,10 @@ export default function App() {
                 No complex matrix. A single comprehensive subscription giving you real-time screen capture analysis and loopback suggestions.
               </p>
               <div className="mt-4 inline-flex items-center gap-2 bg-slate-900 border border-slate-800 rounded-xl px-4 py-2 text-xs">
-                <span className="text-slate-400 font-mono">Current Subscriber email:</span>
-                <span className="text-indigo-400 font-mono font-semibold">{userEmail}</span>
+                <span className="text-slate-400 font-mono">Billing email:</span>
+                <span className={`font-mono font-semibold ${userEmail ? "text-indigo-400" : "text-amber-400"}`}>
+                  {userEmail || "Not set — enter your email on the Platform tab"}
+                </span>
               </div>
             </div>
 

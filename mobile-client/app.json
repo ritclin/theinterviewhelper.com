@@ -1,0 +1,38 @@
+{
+  "expo": {
+    "name": "Interview Helper",
+    "slug": "the-interview-helper",
+    "version": "1.0.0",
+    "orientation": "portrait",
+    "userInterfaceStyle": "dark",
+    "splash": {
+      "backgroundColor": "#020617"
+    },
+    "plugins": [
+      [
+        "expo-av",
+        {
+          "microphonePermission": "Allow Interview Helper to listen to interview questions from your laptop speakers."
+        }
+      ]
+    ],
+    "assetBundlePatterns": ["**/*"],
+    "ios": {
+      "supportsTablet": true,
+      "bundleIdentifier": "com.theinterviewhelper.companion"
+    },
+    "android": {
+      "adaptiveIcon": {
+        "backgroundColor": "#020617"
+      },
+      "package": "com.theinterviewhelper.companion",
+      "permissions": [
+        "RECORD_AUDIO",
+        "MODIFY_AUDIO_SETTINGS",
+        "FOREGROUND_SERVICE",
+        "FOREGROUND_SERVICE_MICROPHONE",
+        "WAKE_LOCK"
+      ]
+    }
+  }
+}

@@ -17,6 +17,14 @@ export interface SocketPayload {
   timestamp: number;
 }
 
+export interface InterviewProfile {
+  targetPosition: string;
+  company: string;
+  jobDescription: string;
+  userCv: string;
+  specialInstructions: string;
+}
+
 export interface InterviewScenario {
   id: string;
   title: string;
