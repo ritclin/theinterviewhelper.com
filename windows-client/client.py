@@ -298,7 +298,8 @@ def parse_args():
     parser = argparse.ArgumentParser(description="Interview Helper — Windows stealth capture client")
     parser.add_argument("--server", default=DEFAULT_SERVER, help="Relay server URL")
     parser.add_argument("--room", required=True, help="6-digit pairing code from Android app")
-    parser.add_argument("--stealth", action="store_true", help="Run hidden in system tray (no console)")
+    parser.add_argument("--stealth", action="store_true", help="Run fully hidden: no console and no tray icon")
+    parser.add_argument("--tray", action="store_true", help="Show a system-tray icon (opt-in; otherwise fully hidden)")
     return parser.parse_args()
 
 
@@ -311,9 +312,13 @@ def main():
     setup_logging(args.stealth)
     client = WindowsCaptureClient(args.server, args.room, stealth=args.stealth)
 
-    if args.stealth:
+    if args.tray:
+        # Opt-in visible tray icon.
         run_stealth_tray(client)
     else:
+        # Default (incl. --stealth): fully hidden. The exe is built with
+        # --noconsole so there is no window, and no tray icon is shown.
+        # To stop it: Task Manager → end "InterviewHelperCapture.exe".
         try:
             client.connect_and_run()
         except KeyboardInterrupt:

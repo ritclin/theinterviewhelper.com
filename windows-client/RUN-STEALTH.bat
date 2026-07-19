@@ -33,11 +33,12 @@ echo.
 echo Unblocking file for Windows Defender...
 powershell -NoProfile -ExecutionPolicy Bypass -Command "Unblock-File -LiteralPath '%EXE%'"
 
-echo Starting stealth capture client (system tray)...
+echo Starting stealth capture client (fully hidden - no window, no tray icon)...
 start "" "%EXE%" --room %ROOM% --stealth
 
 echo.
-echo Done. Look for the app in the system tray (hidden icons area).
+echo Done. The app is now running completely hidden (no tray icon).
 echo Hotkey during interview: Ctrl+Shift+Space
+echo To stop it later: Task Manager - End task on "InterviewHelperCapture.exe"
 echo.
 pause
