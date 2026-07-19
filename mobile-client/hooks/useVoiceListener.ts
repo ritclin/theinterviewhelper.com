@@ -55,7 +55,10 @@ async function configureAudioSession() {
   await Audio.setAudioModeAsync({
     allowsRecordingIOS: true,
     playsInSilentModeIOS: true,
-    staysActiveInBackground: true,
+    // staysActiveInBackground requires a configured Android foreground service and
+    // throws on many release builds; the screen is kept awake (useKeepAwake) so we
+    // don't need background recording. Keeping this false avoids that failure.
+    staysActiveInBackground: false,
     shouldDuckAndroid: true,
     playThroughEarpieceAndroid: false,
     interruptionModeAndroid: InterruptionModeAndroid.DoNotMix,
@@ -110,21 +113,29 @@ export function useVoiceListener({
       return;
     }
 
+    // Configuring the audio session is best-effort — recording can still work if
+    // it fails, so never abort the whole loop just because this throws.
     try {
       await configureAudioSession();
     } catch {
-      onError?.("Could not configure audio. Close other apps using the microphone and try again.");
-      loopRef.current = false;
-      return;
+      // ignore and continue
     }
 
     while (loopRef.current) {
       let recording: Audio.Recording | null = null;
       try {
-        recording = new Audio.Recording();
-        await recording.prepareToRecordAsync(RECORDING_OPTIONS);
+        // Release any stale recording first — Android allows only one prepared
+        // Recording at a time, so a leftover instance would make the next start throw.
+        if (recordingRef.current) {
+          try { await recordingRef.current.stopAndUnloadAsync(); } catch { /* ignore */ }
+          recordingRef.current = null;
+        }
+
+        // createAsync prepares + starts in one call (more robust than the manual
+        // new Recording() + prepare + start sequence).
+        const created = await Audio.Recording.createAsync(RECORDING_OPTIONS);
+        recording = created.recording;
         recordingRef.current = recording;
-        await recording.startAsync();
         setIsListening(true);
         failCountRef.current = 0;
 
@@ -134,7 +145,6 @@ export function useVoiceListener({
         await recording.stopAndUnloadAsync();
         const uri = recording.getURI();
         recordingRef.current = null;
-        setIsListening(false);
 
         if (uri && loopRef.current) {
           await transcribeFile(uri);
@@ -145,9 +155,8 @@ export function useVoiceListener({
           }
         }
 
-        await new Promise((r) => setTimeout(r, 400));
+        await new Promise((r) => setTimeout(r, 300));
       } catch (err) {
-        setIsListening(false);
         recordingRef.current = null;
         if (recording) {
           try {
@@ -156,18 +165,22 @@ export function useVoiceListener({
             // ignore
           }
         }
+        if (!loopRef.current) break;
 
         failCountRef.current += 1;
-        if (failCountRef.current >= 3 || !loopRef.current) {
+        if (failCountRef.current >= 5) {
+          setIsListening(false);
           onError?.(
-            "Microphone error. Allow microphone access, keep the phone near laptop speakers, and tap Resume listening."
+            "Couldn't access the microphone. Tap Resume to retry — or just use Ctrl+Shift+Space on the PC to send the screen for an answer."
           );
           loopRef.current = false;
           break;
         }
 
-        await configureAudioSession();
-        await new Promise((r) => setTimeout(r, 800));
+        // Back off and re-affirm the audio session, but never let this throw out
+        // of the loop (that would kill listening after a single transient error).
+        try { await configureAudioSession(); } catch { /* ignore */ }
+        await new Promise((r) => setTimeout(r, 1000));
       }
     }
     setIsListening(false);
