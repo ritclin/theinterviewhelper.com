@@ -1449,10 +1449,15 @@ Rules: No greetings. Scannable in 5-8 seconds. Be accurate to the candidate's se
 
           if (imageValue && isLikelyBase64Image(imageValue)) {
             const base64Data = imageValue.includes("base64,") ? imageValue.split("base64,")[1] : imageValue;
+            // Use the ACTUAL image type from the data URI. The Windows client sends
+            // JPEG; hard-coding image/png made Gemini reject it and silently fall
+            // back to the canned simulation answer.
+            const mimeMatch = imageValue.match(/^data:(image\/[a-zA-Z0-9.+-]+);base64,/);
+            const imageMime = mimeMatch ? mimeMatch[1].toLowerCase() : "image/jpeg";
             contents.push({
               inlineData: {
                 data: base64Data,
-                mimeType: "image/png"
+                mimeType: imageMime
               }
             });
           }
@@ -1503,8 +1508,14 @@ Rules: No greetings. Scannable in 5-8 seconds. Be accurate to the candidate's se
 
         } catch (err: any) {
           console.error("Gemini API stream error:", err);
-          io.to(`room-${roomCode}`).emit("ai-error", { error: "Gemini API error: " + err.message });
-          await runSimulationFallback(roomCode, room, prompt, audioTranscript);
+          // Degrade gracefully to the simulation instead of dumping a raw error on
+          // top of a delivered answer. Only surface an error if the fallback fails.
+          try {
+            await runSimulationFallback(roomCode, room, prompt, audioTranscript);
+          } catch (fallbackErr: any) {
+            console.error("Simulation fallback error:", fallbackErr);
+            io.to(`room-${roomCode}`).emit("ai-error", { error: "Suggestion engine temporarily unavailable. Please retry." });
+          }
         }
       } else {
         await runSimulationFallback(roomCode, room, prompt, audioTranscript);
