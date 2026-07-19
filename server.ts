@@ -63,13 +63,11 @@ const apiKey = process.env.GEMINI_API_KEY;
 let aiClient: GoogleGenAI | null = null;
 
 if (apiKey && apiKey !== "MY_GEMINI_API_KEY" && apiKey.trim() !== "") {
+  // NOTE: do NOT override User-Agent here. The old 'aistudio-build' header was a
+  // leftover from Google AI Studio's hosted runtime and can make the public
+  // Gemini API reject requests from a normal deployment (e.g. Railway).
   aiClient = new GoogleGenAI({
     apiKey: apiKey,
-    httpOptions: {
-      headers: {
-        'User-Agent': 'aistudio-build',
-      }
-    }
   });
   console.log("Gemini AI Client successfully initialized.");
 } else {
@@ -734,6 +732,24 @@ Rules: No greetings. Scannable in 5-8 seconds. Be accurate to the candidate's se
     });
   });
 
+  // Diagnostic: minimal Gemini call to surface the EXACT error if AI is failing.
+  // Safe to call publicly — returns only health/error text, never the API key.
+  app.get("/api/ai-selftest", async (_req, res) => {
+    const model = process.env.GEMINI_MODEL || "gemini-2.5-flash";
+    if (!aiClient) {
+      return res.json({ ok: false, configured: false, model, error: "No GEMINI_API_KEY configured on the server." });
+    }
+    try {
+      const result = await aiClient.models.generateContent({
+        model,
+        contents: "Reply with the single word: pong",
+      });
+      res.json({ ok: true, configured: true, model, text: String(result.text || "").slice(0, 100) });
+    } catch (err: any) {
+      res.json({ ok: false, configured: true, model, error: String(err?.message || err).slice(0, 800) });
+    }
+  });
+
   app.post("/api/transcribe-audio", async (req, res) => {
     const { email, audioBase64, mimeType, roomCode } = req.body || {};
     const targetEmail = String(email || "").toLowerCase().trim();
@@ -770,7 +786,7 @@ Rules: No greetings. Scannable in 5-8 seconds. Be accurate to the candidate's se
         transcript = (result.text || "").trim();
       } catch (err: any) {
         console.error("[Transcribe] Gemini error:", err.message);
-        return res.status(500).json({ success: false, error: "Transcription failed." });
+        return res.status(500).json({ success: false, error: "Transcription failed: " + String(err?.message || err).slice(0, 300) });
       }
     } else {
       transcript = "[Simulated transcript] Explain the time complexity of your solution and walk through the algorithm.";
