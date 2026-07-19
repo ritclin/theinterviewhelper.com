@@ -16,8 +16,10 @@ type Options = {
 const RECORDING_OPTIONS: Audio.RecordingOptions = {
   isMeteringEnabled: false,
   android: {
-    extension: ".m4a",
-    outputFormat: Audio.AndroidOutputFormat.MPEG_4,
+    // AAC in an ADTS (.aac) container → mime audio/aac, which Gemini accepts.
+    // The old MPEG_4/.m4a produced audio/mp4, which Gemini rejects (no transcript).
+    extension: ".aac",
+    outputFormat: Audio.AndroidOutputFormat.AAC_ADTS,
     audioEncoder: Audio.AndroidAudioEncoder.AAC,
     sampleRate: 16000,
     numberOfChannels: 1,
@@ -92,7 +94,7 @@ export function useVoiceListener({
         body: JSON.stringify({
           email: email.trim().toLowerCase(),
           roomCode,
-          mimeType: Platform.OS === "android" ? "audio/mp4" : "audio/m4a",
+          mimeType: Platform.OS === "android" ? "audio/aac" : "audio/mp4",
           audioBase64,
         }),
       });
