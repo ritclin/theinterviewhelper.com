@@ -734,20 +734,33 @@ Rules: No greetings. Scannable in 5-8 seconds. Be accurate to the candidate's se
 
   // Diagnostic: minimal Gemini call to surface the EXACT error if AI is failing.
   // Safe to call publicly — returns only health/error text, never the API key.
-  app.get("/api/ai-selftest", async (_req, res) => {
-    const model = process.env.GEMINI_MODEL || "gemini-2.5-flash";
+  app.get("/api/ai-selftest", async (req, res) => {
     if (!aiClient) {
-      return res.json({ ok: false, configured: false, model, error: "No GEMINI_API_KEY configured on the server." });
+      return res.json({ ok: false, configured: false, error: "No GEMINI_API_KEY configured on the server." });
     }
-    try {
-      const result = await aiClient.models.generateContent({
-        model,
-        contents: "Reply with the single word: pong",
-      });
-      res.json({ ok: true, configured: true, model, text: String(result.text || "").slice(0, 100) });
-    } catch (err: any) {
-      res.json({ ok: false, configured: true, model, error: String(err?.message || err).slice(0, 800) });
+    const activeDefault = process.env.GEMINI_MODEL || "gemini-flash-latest";
+    const override = typeof req.query.model === "string" ? req.query.model.trim() : "";
+    // Probe candidate models against the real key so we can pick one that works.
+    const candidates = override
+      ? [override]
+      : [...new Set([
+          activeDefault,
+          "gemini-flash-latest",
+          "gemini-3.5-flash",
+          "gemini-3-flash-preview",
+          "gemini-3.1-flash-lite",
+          "gemini-2.0-flash",
+        ])];
+    const results: Array<{ model: string; ok: boolean; text?: string; error?: string }> = [];
+    for (const model of candidates) {
+      try {
+        const r = await aiClient.models.generateContent({ model, contents: "Reply with the single word: pong" });
+        results.push({ model, ok: true, text: String(r.text || "").slice(0, 40) });
+      } catch (err: any) {
+        results.push({ model, ok: false, error: String(err?.message || err).slice(0, 200) });
+      }
     }
+    res.json({ ok: results.some((r) => r.ok), activeDefault, results });
   });
 
   app.post("/api/transcribe-audio", async (req, res) => {
@@ -775,7 +788,7 @@ Rules: No greetings. Scannable in 5-8 seconds. Be accurate to the candidate's se
 
     if (aiClient) {
       try {
-        const geminiModel = process.env.GEMINI_MODEL || "gemini-2.5-flash";
+        const geminiModel = process.env.GEMINI_MODEL || "gemini-flash-latest";
         const result = await aiClient.models.generateContent({
           model: geminiModel,
           contents: [
@@ -1335,7 +1348,7 @@ Rules: No greetings. Scannable in 5-8 seconds. Be accurate to the candidate's se
               ? String(payload.audioBase64).split("base64,")[1]
               : String(payload.audioBase64);
             if (estimateBase64Bytes(raw) <= LIMITS.MAX_AUDIO_BYTES) {
-              const geminiModel = process.env.GEMINI_MODEL || "gemini-2.5-flash";
+              const geminiModel = process.env.GEMINI_MODEL || "gemini-flash-latest";
               const result = await aiClient.models.generateContent({
                 model: geminiModel,
                 contents: [
@@ -1454,7 +1467,7 @@ Rules: No greetings. Scannable in 5-8 seconds. Be accurate to the candidate's se
       // Build Gemini contents
       let aiResponseStream = null;
       let completedText = "";
-      const geminiModel = process.env.GEMINI_MODEL || "gemini-2.5-flash";
+      const geminiModel = process.env.GEMINI_MODEL || "gemini-flash-latest";
 
       try {
       if (aiClient) {
