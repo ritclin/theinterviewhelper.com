@@ -74,6 +74,29 @@ if (apiKey && apiKey !== "MY_GEMINI_API_KEY" && apiKey.trim() !== "") {
   console.log("No valid GEMINI_API_KEY found in environment. Fallback high-fidelity simulation enabled.");
 }
 
+const DEFAULT_GEMINI_MODEL = "gemini-flash-latest";
+// Models Google has retired for new API keys — if one of these is pinned via the
+// GEMINI_MODEL env var (a common leftover), ignore it and self-heal to the latest
+// Flash alias instead of 404-ing every request.
+const RETIRED_GEMINI_MODELS = new Set([
+  "gemini-2.5-flash",
+  "gemini-1.5-flash",
+  "gemini-1.5-pro",
+  "gemini-1.0-pro",
+  "gemini-pro",
+  "gemini-pro-vision",
+]);
+
+function resolveGeminiModel(): string {
+  const configured = (process.env.GEMINI_MODEL || "").trim();
+  if (!configured) return DEFAULT_GEMINI_MODEL;
+  if (RETIRED_GEMINI_MODELS.has(configured)) {
+    console.warn(`[Gemini] GEMINI_MODEL='${configured}' is retired; using '${DEFAULT_GEMINI_MODEL}' instead. Update or remove the env var.`);
+    return DEFAULT_GEMINI_MODEL;
+  }
+  return configured;
+}
+
 async function startServer() {
   const app = express();
   const isProduction = isRunningProductionBundle();
@@ -738,7 +761,7 @@ Rules: No greetings. Scannable in 5-8 seconds. Be accurate to the candidate's se
     if (!aiClient) {
       return res.json({ ok: false, configured: false, error: "No GEMINI_API_KEY configured on the server." });
     }
-    const activeDefault = process.env.GEMINI_MODEL || "gemini-flash-latest";
+    const activeDefault = resolveGeminiModel();
     const override = typeof req.query.model === "string" ? req.query.model.trim() : "";
     // Probe candidate models against the real key so we can pick one that works.
     const candidates = override
@@ -788,7 +811,7 @@ Rules: No greetings. Scannable in 5-8 seconds. Be accurate to the candidate's se
 
     if (aiClient) {
       try {
-        const geminiModel = process.env.GEMINI_MODEL || "gemini-flash-latest";
+        const geminiModel = resolveGeminiModel();
         const result = await aiClient.models.generateContent({
           model: geminiModel,
           contents: [
@@ -1348,7 +1371,7 @@ Rules: No greetings. Scannable in 5-8 seconds. Be accurate to the candidate's se
               ? String(payload.audioBase64).split("base64,")[1]
               : String(payload.audioBase64);
             if (estimateBase64Bytes(raw) <= LIMITS.MAX_AUDIO_BYTES) {
-              const geminiModel = process.env.GEMINI_MODEL || "gemini-flash-latest";
+              const geminiModel = resolveGeminiModel();
               const result = await aiClient.models.generateContent({
                 model: geminiModel,
                 contents: [
@@ -1467,7 +1490,7 @@ Rules: No greetings. Scannable in 5-8 seconds. Be accurate to the candidate's se
       // Build Gemini contents
       let aiResponseStream = null;
       let completedText = "";
-      const geminiModel = process.env.GEMINI_MODEL || "gemini-flash-latest";
+      const geminiModel = resolveGeminiModel();
 
       try {
       if (aiClient) {
